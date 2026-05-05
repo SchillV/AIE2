@@ -1,0 +1,9 @@
+Model,Threshold,Accuracy,Precision,Recall,F1-score,ROC-AUC,PR-AUC
+Logistic Regression (default),0.5,0.8659,0.3336,0.8407,0.4777,0.9236,0.4737
+Logistic Regression (tuned),0.8267,0.9235,0.4808,0.6101,0.5378,0.9236,0.4737
+Random Forest (default),0.5,0.8424,0.3006,0.8751,0.4475,0.9253,0.4868
+Random Forest (tuned),0.81,0.9204,0.467,0.6421,0.5407,0.9253,0.4868
+XGBoost (default),0.5,0.845,0.3042,0.8737,0.4513,0.9259,0.4925
+XGBoost (tuned),0.8183,0.9202,0.4664,0.649,0.5428,0.9259,0.4925
+Ensemble (default),0.5,0.8526,0.3145,0.8646,0.4612,0.9257,0.4897
+Ensemble (tuned),0.8084,0.9205,0.4674,0.645,0.542,0.9257,0.4897
