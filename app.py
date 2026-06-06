@@ -128,7 +128,7 @@ def _clear_caches() -> None:
 # ─── Action helpers ──────────────────────────────────────────────────────────
 
 def _do_update_data() -> bool:
-    from main import fetch_exchange_rates, save_to_csv
+    from core.scraper import fetch_exchange_rates, save_to_csv
     try:
         headers, rows = fetch_exchange_rates()
         if not rows:
@@ -405,7 +405,6 @@ def _confirm_retrain_widget(key: str, label: str, action) -> None:
         st.session_state[f"run_{key}"] = False
         action()
         st.rerun()
-                st.rerun()
 
     # Run action at full page width — outside the columns above.
     if st.session_state.get(f"run_{key}"):
@@ -465,7 +464,6 @@ def page_overview() -> None:
         st.session_state["do_retrain_all_now"] = False
         _do_retrain_all()
         st.rerun()
-                st.rerun()
 
     # Run at full page width — outside all columns above.
     if st.session_state.get("do_retrain_all_now"):
@@ -664,8 +662,8 @@ def page_about() -> None:
     st.subheader("Quick Start")
     st.markdown("""
 ```bash
-pip install -r requirements.txt    # install dependencies
-python main.py                      # fetch BNR exchange-rate data
+pip install -r requirements.txt     # install dependencies
+python -m core.scraper              # fetch BNR exchange-rate data
 python -m core.pipeline             # train all models  (~15–30 min)
 streamlit run app.py                # launch this app
 ```
@@ -677,12 +675,12 @@ Data updates and retraining can also be triggered directly from the **Overview**
     st.markdown("""
 | File | Purpose |
 |------|---------|
-| `main.py` | Scraper — POSTs to cursbnr.ro, saves `resources/data/idr_exchange_rates.csv` |
-| `app.py` | This Streamlit application |
+| `app.py` | This Streamlit application (primary entry point) |
+| `core/scraper.py` | Scraper — POSTs to cursbnr.ro, saves `resources/data/idr_exchange_rates.csv` |
 | `core/models.py` | Data loading (100 IDR scale), walk-forward CV, ARIMA/SARIMAX/ES tuning |
 | `core/pipeline.py` | CLI retraining pipeline + `retrain_single_model()` |
 | `core/visualize.py` | `make_forecast_figure()`, `make_per_model_diagnostic_figure()` |
-| `resources/data/idr_exchange_rates.csv` | Exchange-rate data fetched by `main.py` |
+| `resources/data/idr_exchange_rates.csv` | Exchange-rate data fetched by `core/scraper.py` |
 | `resources/models/all_results.json` | CV results for all three models |
 | `resources/models/*_<timestamp>.pkl` | Per-model fitted objects |
 | `resources/models/diagnostics.png` | Combined diagnostic figure (CLI pipeline only) |

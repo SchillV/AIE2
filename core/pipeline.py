@@ -13,6 +13,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import pandas as pd
+
 from .models import (
     load_series,
     tune_arima,
@@ -21,9 +24,10 @@ from .models import (
     compare_models,
     fit_final_model,
 )
-from .visualize import generate_all_plots
+from .visualize import generate_all_plots, make_per_model_diagnostic_figure
 
 OUTPUT_DIR = Path("resources") / "models"
+LOG_DIR = Path("logs")
 DEFAULT_CSV = str(Path("resources") / "data" / "idr_exchange_rates.csv")
 
 MODEL_NAMES = ["ARIMA", "SARIMAX", "ExponentialSmoothing"]
@@ -76,6 +80,83 @@ def _save_model_pkl(model_name: str, result: dict, fitted, timestamp: str) -> Pa
     return path
 
 
+def _write_logs(
+    timestamp: str,
+    all_results: dict,
+    fitted_map: dict,
+    series: "pd.Series",
+) -> None:
+    """Write per-run diagnostics to logs/<timestamp>/.
+
+    Outputs
+    -------
+    results_summary.csv              MAE, AIC, best-params for each model
+    cv_folds.csv                     fold-by-fold MAE for each model
+    <model>_diagnostics.png          2×2 diagnostic figure per model
+    diagnostics.png                  combined 2×3 all-models figure
+    """
+    log_dir = LOG_DIR / timestamp
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    best_name = all_results.get("best", {}).get("model", "")
+
+    # ── results_summary.csv ───────────────────────────────────────────────────
+    rows: list[dict] = []
+    for name in MODEL_NAMES:
+        res = all_results.get(name)
+        if res is None:
+            continue
+        row: dict = {
+            "model": name,
+            "is_best": name == best_name,
+            "mean_mae": res.get("mean_mae"),
+            "std_mae": res.get("std_mae"),
+            "aic": res.get("aic", ""),
+        }
+        if "order" in res:
+            row["order"] = str(res["order"])
+        if "seasonal_order" in res:
+            row["seasonal_order"] = str(res["seasonal_order"])
+        if "trend" in res:
+            row["trend"] = res.get("trend")
+            row["seasonal"] = res.get("seasonal")
+            row["damped_trend"] = res.get("damped_trend")
+            row["seasonal_periods"] = res.get("seasonal_periods")
+        rows.append(row)
+
+    pd.DataFrame(rows).to_csv(log_dir / "results_summary.csv", index=False)
+    print(f"  · results_summary.csv")
+
+    # ── cv_folds.csv ──────────────────────────────────────────────────────────
+    fold_rows: list[dict] = []
+    for name in MODEL_NAMES:
+        res = all_results.get(name) or {}
+        for i, mae in enumerate(res.get("fold_maes", []), 1):
+            fold_rows.append({"model": name, "fold": i, "mae": mae})
+
+    pd.DataFrame(fold_rows).to_csv(log_dir / "cv_folds.csv", index=False)
+    print(f"  · cv_folds.csv")
+
+    # ── per-model 2×2 diagnostic PNGs ─────────────────────────────────────────
+    for name in MODEL_NAMES:
+        fitted = fitted_map.get(name)
+        res = all_results.get(name)
+        if fitted is None or res is None:
+            continue
+        prefix = _PKL_PREFIX.get(name, name.lower())
+        fig = make_per_model_diagnostic_figure(series, fitted, res)
+        fig.savefig(log_dir / f"{prefix}_diagnostics.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  · {prefix}_diagnostics.png")
+
+    # ── combined 2×3 all-models PNG ───────────────────────────────────────────
+    best_fitted = fitted_map.get(best_name)
+    if best_fitted is not None:
+        generate_all_plots(series, best_fitted, all_results, log_dir)
+
+    print(f"Training logs → {log_dir}/")
+
+
 # --------------------------------------------------------------------------- #
 # Full pipeline                                                                #
 # --------------------------------------------------------------------------- #
@@ -89,6 +170,7 @@ def retrain_pipeline(csv_path: str = DEFAULT_CSV) -> dict:
       4. Fit all three models on full series and persist each
       5. Save all_results.json + best_params.json
       6. Regenerate diagnostics PNG
+      7. Write per-run debug logs to logs/<timestamp>/
     Returns the all_results dict.
     """
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -99,7 +181,7 @@ def retrain_pipeline(csv_path: str = DEFAULT_CSV) -> dict:
     csv_path = Path(csv_path)
     if not csv_path.exists():
         print(f"[ERROR] CSV not found: {csv_path}")
-        print("        Run  python main.py  first to fetch exchange-rate data.")
+        print("        Run  python -m core.scraper  first to fetch exchange-rate data.")
         sys.exit(1)
 
     series = load_series(csv_path)
@@ -151,7 +233,7 @@ def retrain_pipeline(csv_path: str = DEFAULT_CSV) -> dict:
         json.dump(serialisable_best, fh, indent=2)
     print(f"Best params       → {best_params_path}")
 
-    # Diagnostics PNG
+    # Diagnostics PNG (combined, to resources/models/)
     all_results = {
         "ARIMA": arima_res,
         "SARIMAX": sarimax_res,
@@ -159,7 +241,11 @@ def retrain_pipeline(csv_path: str = DEFAULT_CSV) -> dict:
         "best": best,
     }
     print()
-    generate_all_plots(series, fitted_map[best["model"]], all_results)
+    generate_all_plots(series, fitted_map[best["model"]], all_results, OUTPUT_DIR)
+
+    # Per-run debug logs
+    print("\nWriting training logs …")
+    _write_logs(timestamp, all_results, fitted_map, series)
 
     print("\nPipeline complete.")
     return all_results
