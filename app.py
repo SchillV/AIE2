@@ -42,6 +42,89 @@ _DISPLAY = {
 }
 _PAGES = ["Overview", "ARIMA", "Exponential Smoothing", "Naive", "Naive + Drift", "About"]
 
+_MODEL_DESCRIPTION = {
+    "ARIMA": """\
+**ARIMA (AutoRegressive Integrated Moving Average)**
+
+ARIMA(p, d, q) combines three components:
+
+- **AR(p)** — the forecast is a linear combination of the `p` most recent values
+- **I(d)** — the series is differenced `d` times to remove the unit root and make it stationary
+- **MA(q)** — the forecast also depends on the `q` most recent one-step forecast errors
+
+For IDR/RON, the integration order `d` is determined automatically each run via an **ADF
+(Augmented Dickey-Fuller) unit-root test**.  Daily FX rates are typically I(1) (random walk),
+so the model is usually fit on first differences.  Fixing `d` before the grid search ensures
+AIC values are comparable across all (p, q) candidates.
+
+The best (p, q) pair is selected by AIC pre-filter followed by walk-forward cross-validation.
+95% confidence intervals are produced by the Kalman filter's covariance matrix.
+""",
+
+    "ExponentialSmoothing": """\
+**Exponential Smoothing (Holt method, non-seasonal)**
+
+Exponential Smoothing assigns exponentially decreasing weights to past observations — recent
+values matter more than distant ones.  This implementation uses the **Holt** (two-component)
+variant with an optional trend:
+
+- **Simple ES** (`trend=None`) — smoothed level only; equivalent to an EWMA forecast
+- **Additive trend** (`trend="add"`) — level + linear trend component
+- **Multiplicative trend** (`trend="mul"`) — level + proportionally scaled trend
+- **Damped trend** — the trend is gradually pulled toward zero at long horizons, avoiding
+  unrealistic straight-line extrapolation
+
+Seasonal options are excluded: daily FX rates show no meaningful weekly or monthly
+periodicity, and including them would add noise without improving accuracy.
+
+All smoothing parameters (α, β) are estimated by maximum likelihood.  95% confidence
+intervals are computed by bootstrap resampling of in-sample residuals (500 draws).
+""",
+
+    "Naive": """\
+**Naive Forecast (last-value baseline)**
+
+The simplest possible forecast: **tomorrow's rate equals today's rate**.
+
+```
+ŷ_{t+1} = y_t
+```
+
+This is equivalent to assuming the exchange rate follows a pure random walk with no drift.
+Under the weak form of the Efficient Market Hypothesis, this is the best forecast an
+outsider can make — future price movements are unpredictable from past prices alone.
+
+The Naive model serves as the **primary benchmark**: any statistically motivated model that
+cannot consistently outperform it on walk-forward CV is not adding value.  The CV MAE here
+is the floor that ARIMA and Exponential Smoothing are competing against.
+
+Confidence intervals are constructed by bootstrap resampling of in-sample first differences
+(the empirical distribution of one-day rate changes).
+""",
+
+    "NaiveDrift": """\
+**Naive with Drift**
+
+An extension of the Naive forecast that adds the **mean daily change** over all historical
+data seen so far:
+
+```
+ŷ_{t+1} = y_t + mean(Δy_1, Δy_2, …, Δy_t)
+```
+
+If the exchange rate has been trending — appreciating or depreciating on average over the
+training window — the drift term captures that momentum.  The drift is recalculated at every
+step of walk-forward CV, so it reflects only information available before each prediction.
+
+For a currency pair that has been gradually moving in one direction this will modestly
+outperform the pure Naive model; for a mean-reverting pair the drift can hurt.  Comparing
+this model against the plain Naive shows whether the historical trend carries any predictive
+signal.
+
+Confidence intervals are constructed by bootstrap resampling of in-sample residuals.
+""",
+}
+
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="IDR/RON Forecaster",
@@ -536,29 +619,8 @@ def page_overview() -> None:
         )
         return
 
-    # ── Model comparison table ────────────────────────────────────────────
-    st.subheader("Model Performance Comparison")
     best_name = all_results.get("best", {}).get("model", "")
     sorted_models = _sorted_models(all_results)
-    table_rows = []
-    for rank, r in enumerate(sorted_models, 1):
-        name = r["model"]
-        table_rows.append({
-            "Rank": f"{'★ ' if name == best_name else ''}#{rank}",
-            "Model": _DISPLAY.get(name, name),
-            "Mean CV MAE": f"{r['mean_mae']:.6f}",
-            "Std CV MAE": f"{r['std_mae']:.6f}",
-            "Best Params": _params_short(r),
-        })
-    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
-    # Trained on timestamp
-    ts = all_results.get("timestamp", "")
-    if ts:
-        dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
-        st.caption(f"Last trained: {dt.strftime('%d %b %Y %H:%M')}")
-
-    st.divider()
 
     # ── Forecast charts ───────────────────────────────────────────────────
     st.subheader("Retroactive Forecast Charts (strongest model first)")
@@ -582,6 +644,28 @@ def page_overview() -> None:
                 st.plotly_chart(fig, use_container_width=True)
             except Exception as exc:
                 st.error(f"Chart error: {exc}")
+
+    st.divider()
+
+    # ── Model comparison table ────────────────────────────────────────────
+    st.subheader("Model Performance Comparison")
+    table_rows = []
+    for rank, r in enumerate(sorted_models, 1):
+        name = r["model"]
+        table_rows.append({
+            "Rank": f"{'★ ' if name == best_name else ''}#{rank}",
+            "Model": _DISPLAY.get(name, name),
+            "Mean CV MAE": f"{r['mean_mae']:.6f}",
+            "Std CV MAE": f"{r['std_mae']:.6f}",
+            "Best Params": _params_short(r),
+        })
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+    # Trained on timestamp
+    ts = all_results.get("timestamp", "")
+    if ts:
+        dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+        st.caption(f"Last trained: {dt.strftime('%d %b %Y %H:%M')}")
 
 
 def page_model(model_name: str) -> None:
@@ -643,11 +727,10 @@ def page_model(model_name: str) -> None:
     if pkl_data is not None:
         fitted = pkl_data.get("fitted")
         if fitted is not None:
-            from core.visualize import make_per_model_diagnostic_figure
+            from core.visualize import make_per_model_diagnostic_figure_plotly
             try:
-                diag_fig = make_per_model_diagnostic_figure(series, fitted, result)
-                st.pyplot(diag_fig, use_container_width=True)
-                plt.close(diag_fig)
+                diag_fig = make_per_model_diagnostic_figure_plotly(series, fitted, result)
+                st.plotly_chart(diag_fig, use_container_width=True)
             except Exception as exc:
                 st.error(f"Diagnostic plot error: {exc}")
         else:
@@ -668,6 +751,13 @@ def page_model(model_name: str) -> None:
             {"Fold": [f"Fold {i}" for i in range(1, len(fold_maes) + 1)], "MAE": fold_maes}
         ).set_index("Fold")
         st.bar_chart(fold_df, use_container_width=True)
+        st.divider()
+
+    # ── Model description ─────────────────────────────────────────────────
+    desc = _MODEL_DESCRIPTION.get(model_name)
+    if desc:
+        st.subheader("About This Model")
+        st.markdown(desc)
         st.divider()
 
     # ── Retrain ───────────────────────────────────────────────────────────

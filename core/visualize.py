@@ -496,3 +496,160 @@ def make_forecast_figure_static(
     fig.autofmt_xdate()
     fig.tight_layout()
     return fig
+
+
+# --------------------------------------------------------------------------- #
+# Public: interactive Plotly diagnostic figure (used by Streamlit app)        #
+# --------------------------------------------------------------------------- #
+
+def make_per_model_diagnostic_figure_plotly(
+    series: pd.Series,
+    fitted_model,
+    model_result: dict,
+) -> go.Figure:
+    """
+    2×2 interactive Plotly diagnostic figure for a single model.
+
+    Panels
+    ------
+    (1,1) Residuals distribution histogram + normal-fit overlay
+    (1,2) Residuals over time
+    (2,1) MAE per CV fold bar chart
+    (2,2) Actual vs Predicted scatter (in-sample, last 100 observations)
+    """
+    from plotly.subplots import make_subplots
+
+    model_name = model_result.get("model", "Model")
+    residuals = _trim_burnin(fitted_model.resid.dropna(), model_result)
+    fold_maes = model_result.get("fold_maes", [])
+
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            "Residuals Distribution",
+            "Residuals Over Time",
+            "MAE per CV Fold",
+            "Actual vs Predicted (in-sample, last 100)",
+        ),
+        vertical_spacing=0.18,
+        horizontal_spacing=0.10,
+    )
+
+    # ── (1,1) Histogram + normal fit ─────────────────────────────────────
+    fig.add_trace(
+        go.Histogram(
+            x=residuals.values,
+            histnorm="probability density",
+            marker_color="#2c7bb6",
+            opacity=0.72,
+            name="Residuals",
+            showlegend=False,
+        ),
+        row=1, col=1,
+    )
+    x_range = np.linspace(float(residuals.min()), float(residuals.max()), 300)
+    normal_y = stats.norm.pdf(x_range, float(residuals.mean()), float(residuals.std()))
+    fig.add_trace(
+        go.Scatter(
+            x=x_range, y=normal_y,
+            mode="lines",
+            line=dict(color="red", width=2),
+            name="Normal fit",
+            showlegend=False,
+        ),
+        row=1, col=1,
+    )
+
+    # ── (1,2) Residuals over time ─────────────────────────────────────────
+    fig.add_trace(
+        go.Scatter(
+            x=residuals.index, y=residuals.values,
+            mode="lines",
+            line=dict(color="#2c7bb6", width=1),
+            name="Residuals",
+            showlegend=False,
+        ),
+        row=1, col=2,
+    )
+    fig.add_hline(y=0, line_color="red", line_dash="dash", line_width=1.2, row=1, col=2)
+    # Hide weekend gaps in the time-series panel
+    fig.update_xaxes(
+        rangebreaks=[dict(bounds=["sat", "mon"])],
+        row=1, col=2,
+    )
+
+    # ── (2,1) MAE per CV fold ─────────────────────────────────────────────
+    if fold_maes:
+        fold_labels = [f"Fold {i}" for i in range(1, len(fold_maes) + 1)]
+        mean_mae = float(np.mean(fold_maes))
+        fig.add_trace(
+            go.Bar(
+                x=fold_labels, y=fold_maes,
+                marker_color="#2c7bb6",
+                opacity=0.8,
+                name="Fold MAE",
+                showlegend=False,
+            ),
+            row=2, col=1,
+        )
+        fig.add_hline(
+            y=mean_mae,
+            line_color="red", line_dash="dash", line_width=1.5,
+            annotation_text=f"Mean = {mean_mae:.6f}",
+            annotation_position="top right",
+            row=2, col=1,
+        )
+    else:
+        fig.add_annotation(
+            text="No CV data", xref="x3 domain", yref="y3 domain",
+            x=0.5, y=0.5, showarrow=False, row=2, col=1,
+        )
+
+    # ── (2,2) Actual vs Predicted scatter ─────────────────────────────────
+    try:
+        fitted_vals = fitted_model.fittedvalues.dropna().iloc[-100:]
+        actual_vals = series.loc[fitted_vals.index]
+        lo = float(min(actual_vals.min(), fitted_vals.min()))
+        hi = float(max(actual_vals.max(), fitted_vals.max()))
+        fig.add_trace(
+            go.Scatter(
+                x=actual_vals.values, y=fitted_vals.values,
+                mode="markers",
+                marker=dict(color="#2c7bb6", size=5, opacity=0.5),
+                name="Obs",
+                showlegend=False,
+            ),
+            row=2, col=2,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[lo, hi], y=[lo, hi],
+                mode="lines",
+                line=dict(color="red", dash="dash", width=1.5),
+                name="Perfect fit",
+                showlegend=False,
+            ),
+            row=2, col=2,
+        )
+    except Exception:
+        pass
+
+    fig.update_layout(
+        title=dict(
+            text=f"{model_name} – Diagnostic Plots",
+            x=0.5, font=dict(size=14),
+        ),
+        height=700,
+        template="plotly_white",
+        showlegend=False,
+    )
+    fig.update_xaxes(title_text="Residual", row=1, col=1)
+    fig.update_yaxes(title_text="Density", row=1, col=1)
+    fig.update_xaxes(title_text="Date", row=1, col=2)
+    fig.update_yaxes(title_text="Residual", row=1, col=2)
+    fig.update_xaxes(title_text="Fold", row=2, col=1)
+    fig.update_yaxes(title_text="MAE", row=2, col=1)
+    fig.update_xaxes(title_text="Actual", row=2, col=2)
+    fig.update_yaxes(title_text="Predicted", row=2, col=2)
+
+    return fig
