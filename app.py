@@ -593,6 +593,15 @@ def _confirm_retrain_widget(key: str, label: str) -> None:
                 st.rerun()
 
 
+def _watermark() -> None:
+    st.markdown(
+        "<p style='text-align:center;opacity:0.40;font-size:0.75rem;margin-top:2rem'>"
+        "Made by Vlad Schiller &nbsp;&middot;&nbsp; Agentically coded by Claude"
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+
 def _forecast_kwargs() -> dict:
     """Read forecast display settings from session_state for make_forecast_figure."""
     ci_pct = int(st.session_state.get("ci_pct", 95))
@@ -663,6 +672,7 @@ def page_overview() -> None:
             "No exchange-rate data found.  \n"
             "Click **Update Data** to fetch from BNR, then **Retrain All Models** to train the forecasting models."
         )
+        _watermark()
         return
 
     m1, m2, m3, m4 = st.columns(4)
@@ -678,6 +688,7 @@ def page_overview() -> None:
             "Models have not been trained yet.  \n"
             "Click **Retrain All Models** above to run the hyperparameter-tuning pipeline."
         )
+        _watermark()
         return
 
     best_name = all_results.get("best", {}).get("model", "")
@@ -727,6 +738,8 @@ def page_overview() -> None:
     if ts:
         dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
         st.caption(f"Last trained: {dt.strftime('%d %b %Y %H:%M')}")
+
+    _watermark()
 
 
 def page_model(model_name: str) -> None:
@@ -830,6 +843,8 @@ def page_model(model_name: str) -> None:
 
     _confirm_retrain_widget(run_key, f"🔁 Retrain {display_name}")
 
+    _watermark()
+
 
 def page_about() -> None:
     st.title("About")
@@ -881,6 +896,8 @@ Data updates and retraining can also be triggered directly from the **Overview**
 | `resources/models/*_<timestamp>.pkl` | Per-model fitted objects |
 | `resources/models/diagnostics.png` | Combined diagnostic figure (CLI pipeline only) |
 """)
+
+    _watermark()
 
 
 # ─── Chatbot helpers ──────────────────────────────────────────────────────────
@@ -1306,7 +1323,7 @@ def page_settings() -> None:
 
     # ── Chat / LLM ────────────────────────────────────────────────────────────
     st.subheader("Chat")
-    st.radio(
+    selected_backend = st.radio(
         "LLM Backend",
         options=["claude", "ollama"],
         format_func=lambda x: "Claude (Anthropic API)" if x == "claude" else "Local model (Ollama)",
@@ -1316,7 +1333,7 @@ def page_settings() -> None:
     )
     st.divider()
 
-    if st.session_state.get("chat_backend", "claude") == "claude":
+    if selected_backend == "claude":
         st.markdown(
             "**Getting an API key**  \n"
             "Sign in at [console.anthropic.com](https://console.anthropic.com), open "
