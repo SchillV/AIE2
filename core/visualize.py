@@ -17,7 +17,7 @@ import matplotlib.gridspec as gridspec
 import plotly.graph_objects as go
 from scipy import stats
 
-from models import fit_final_model
+from .models import fit_final_model
 
 
 # --------------------------------------------------------------------------- #

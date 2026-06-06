@@ -1,9 +1,9 @@
 """
 Automatic retraining pipeline.
 
-Usage:
-    python pipeline.py                          # uses idr_exchange_rates.csv
-    python pipeline.py --csv path/to/file.csv   # custom CSV path
+Usage (run from the project root):
+    python -m core.pipeline                          # uses default CSV
+    python -m core.pipeline --csv path/to/file.csv   # custom CSV path
 """
 
 import argparse
@@ -13,7 +13,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from models import (
+from .models import (
     load_series,
     tune_arima,
     tune_sarimax,
@@ -21,7 +21,7 @@ from models import (
     compare_models,
     fit_final_model,
 )
-from visualize import generate_all_plots
+from .visualize import generate_all_plots
 
 OUTPUT_DIR = Path("resources") / "models"
 DEFAULT_CSV = str(Path("resources") / "data" / "idr_exchange_rates.csv")

@@ -80,7 +80,7 @@ st.markdown("""
 def _cached_load_series(mtime: float) -> "pd.Series | None":
     if not CSV_PATH.exists():
         return None
-    from models import load_series
+    from core.models import load_series
     return load_series(str(CSV_PATH))
 
 
@@ -145,12 +145,12 @@ def _do_update_data() -> bool:
 
 def _do_retrain_all() -> bool:
     """Run the full pipeline with a live st.status progress panel."""
-    from models import (
+    from core.models import (
         load_series, tune_arima, tune_sarimax, tune_exp_smoothing,
         compare_models, fit_final_model,
     )
-    from pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR
-    from visualize import generate_all_plots
+    from core.pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR
+    from core.visualize import generate_all_plots
 
     MODELS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -266,8 +266,8 @@ def _do_retrain_all() -> bool:
 
 def _do_retrain_single(model_name: str) -> bool:
     """Retune one model with a live st.status progress panel."""
-    from models import load_series, tune_arima, tune_sarimax, tune_exp_smoothing, fit_final_model
-    from pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR, MODEL_NAMES
+    from core.models import load_series, tune_arima, tune_sarimax, tune_exp_smoothing, fit_final_model
+    from core.pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR, MODEL_NAMES
 
     MODELS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -379,6 +379,12 @@ def _confirm_retrain_widget(key: str, label: str, action) -> None:
     The action itself is deferred until *after* the column block closes so that
     any st.status / st.progress panels it creates render at full page width.
     """
+    """Reusable confirm-before-retrain widget.
+
+    The trigger button, warning, and confirm/cancel buttons are rendered here.
+    The action itself is deferred until *after* the column block closes so that
+    any st.status / st.progress panels it creates render at full page width.
+    """
     if st.button(label, key=f"btn_{key}"):
         st.session_state[f"pending_{key}"] = True
 
@@ -392,6 +398,13 @@ def _confirm_retrain_widget(key: str, label: str, action) -> None:
         with col_cancel:
             if st.button("✖ Cancel", key=f"cancel_{key}", use_container_width=True):
                 st.session_state[f"pending_{key}"] = False
+                st.rerun()
+
+    # Run action at full page width — outside the columns above.
+    if st.session_state.get(f"run_{key}"):
+        st.session_state[f"run_{key}"] = False
+        action()
+        st.rerun()
                 st.rerun()
 
     # Run action at full page width — outside the columns above.
@@ -414,16 +427,21 @@ def page_overview() -> None:
     c_upd, c_retrain, _ = st.columns([1.4, 1.8, 4.8])
     with c_upd:
         if st.button("🔄 Update Data", use_container_width=True):
-            with st.status("Fetching latest rates from BNR …", expanded=True) as s:
-                ok = _do_update_data()
-            if ok:
-                s.update(label="✅ Data updated!", state="complete")
-                st.rerun()
+            st.session_state["do_update_data_now"] = True   # defer to full-width context
 
     with c_retrain:
         # Only the trigger button lives inside the narrow column.
         if st.button("🤖 Retrain All Models", key="btn_retrain_all", use_container_width=True):
             st.session_state["pending_retrain_all"] = True
+
+    # Run at full page width — outside all columns above.
+    if st.session_state.get("do_update_data_now"):
+        st.session_state["do_update_data_now"] = False
+        with st.status("Fetching latest rates from BNR …", expanded=True) as s:
+            ok = _do_update_data()
+        if ok:
+            s.update(label="✅ Data updated!", state="complete")
+            st.rerun()
 
     # Confirmation dialog rendered at full page width, outside the columns above.
     if st.session_state.get("pending_retrain_all"):
@@ -436,9 +454,17 @@ def page_overview() -> None:
             if st.button("✅ Confirm retrain", key="confirm_retrain_all", use_container_width=True):
                 st.session_state["pending_retrain_all"] = False
                 st.session_state["do_retrain_all_now"] = True   # defer to full-width context
+                st.session_state["do_retrain_all_now"] = True   # defer to full-width context
         with col_cancel:
             if st.button("✖ Cancel", key="cancel_retrain_all", use_container_width=True):
                 st.session_state["pending_retrain_all"] = False
+                st.rerun()
+
+    # Run at full page width — outside all columns above.
+    if st.session_state.get("do_retrain_all_now"):
+        st.session_state["do_retrain_all_now"] = False
+        _do_retrain_all()
+        st.rerun()
                 st.rerun()
 
     # Run at full page width — outside all columns above.
@@ -503,7 +529,7 @@ def page_overview() -> None:
         "Shaded band = 95% confidence interval."
     )
 
-    from visualize import make_forecast_figure
+    from core.visualize import make_forecast_figure
     for r in sorted_models:
         model_name = r["model"]
         is_best = model_name == best_name
@@ -556,7 +582,7 @@ def page_model(model_name: str) -> None:
 
     # ── Forecast chart ────────────────────────────────────────────────────
     st.subheader("Retroactive Forecast — last 2 months · 2-week prediction window")
-    from visualize import make_forecast_figure
+    from core.visualize import make_forecast_figure
     try:
         fig = make_forecast_figure(series, _normalise_params(result))
         st.plotly_chart(fig, use_container_width=True)
@@ -571,7 +597,7 @@ def page_model(model_name: str) -> None:
     if pkl_data is not None:
         fitted = pkl_data.get("fitted")
         if fitted is not None:
-            from visualize import make_per_model_diagnostic_figure
+            from core.visualize import make_per_model_diagnostic_figure
             try:
                 diag_fig = make_per_model_diagnostic_figure(series, fitted, result)
                 st.pyplot(diag_fig, use_container_width=True)
@@ -638,10 +664,10 @@ def page_about() -> None:
     st.subheader("Quick Start")
     st.markdown("""
 ```bash
-pip install -r requirements.txt   # install dependencies
-python main.py                     # fetch BNR exchange-rate data
-python pipeline.py                 # train all models  (~15–30 min)
-streamlit run app.py               # launch this app
+pip install -r requirements.txt    # install dependencies
+python main.py                      # fetch BNR exchange-rate data
+python -m core.pipeline             # train all models  (~15–30 min)
+streamlit run app.py                # launch this app
 ```
 Data updates and retraining can also be triggered directly from the **Overview** page.
 """)
@@ -652,10 +678,10 @@ Data updates and retraining can also be triggered directly from the **Overview**
 | File | Purpose |
 |------|---------|
 | `main.py` | Scraper — POSTs to cursbnr.ro, saves `resources/data/idr_exchange_rates.csv` |
-| `models.py` | Data loading (100 IDR scale), walk-forward CV, ARIMA/SARIMAX/ES tuning |
-| `pipeline.py` | CLI retraining pipeline + `retrain_single_model()` |
-| `visualize.py` | `make_forecast_figure()`, `make_per_model_diagnostic_figure()` |
 | `app.py` | This Streamlit application |
+| `core/models.py` | Data loading (100 IDR scale), walk-forward CV, ARIMA/SARIMAX/ES tuning |
+| `core/pipeline.py` | CLI retraining pipeline + `retrain_single_model()` |
+| `core/visualize.py` | `make_forecast_figure()`, `make_per_model_diagnostic_figure()` |
 | `resources/data/idr_exchange_rates.csv` | Exchange-rate data fetched by `main.py` |
 | `resources/models/all_results.json` | CV results for all three models |
 | `resources/models/*_<timestamp>.pkl` | Per-model fitted objects |
