@@ -27,18 +27,20 @@ MODELS_DIR = Path("resources") / "models"
 ALL_RESULTS_PATH = MODELS_DIR / "all_results.json"
 PLAN_PATH = Path("plan_implementare_antrenare_modele.md")
 
-MODEL_NAMES = ["ARIMA", "SARIMAX", "ExponentialSmoothing"]
+MODEL_NAMES = ["ARIMA", "ExponentialSmoothing", "Naive", "NaiveDrift"]
 _PKL_PREFIX = {
     "ARIMA": "arima",
-    "SARIMAX": "sarimax",
     "ExponentialSmoothing": "exponentialsmoothing",
+    "Naive": "naive",
+    "NaiveDrift": "naivedrift",
 }
 _DISPLAY = {
     "ARIMA": "ARIMA",
-    "SARIMAX": "SARIMAX",
     "ExponentialSmoothing": "Exponential Smoothing",
+    "Naive": "Naive (last value)",
+    "NaiveDrift": "Naive + Drift",
 }
-_PAGES = ["Overview", "ARIMA", "SARIMAX", "Exponential Smoothing", "About"]
+_PAGES = ["Overview", "ARIMA", "Exponential Smoothing", "Naive", "Naive + Drift", "About"]
 
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -148,8 +150,8 @@ def _do_update_data() -> bool:
 def _do_retrain_all() -> bool:
     """Run the full pipeline with a live st.status progress panel."""
     from core.models import (
-        load_series, tune_arima, tune_sarimax, tune_exp_smoothing,
-        compare_models, fit_final_model,
+        load_series, tune_arima, tune_exp_smoothing,
+        tune_naive, tune_naive_drift, compare_models, fit_final_model,
     )
     from core.pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR, _write_logs
     from core.visualize import generate_all_plots
@@ -172,9 +174,9 @@ def _do_retrain_all() -> bool:
             )
 
             # ── ARIMA ─────────────────────────────────────────────────────
-            prog.progress(8, text="Tuning ARIMA — computing AIC candidates …")
+            prog.progress(8, text="Tuning ARIMA — ADF test + AIC candidates …")
             st.write("---")
-            st.write("🔍 **ARIMA** — AIC pre-filter + walk-forward CV …")
+            st.write("🔍 **ARIMA** — ADF integration test + AIC pre-filter + walk-forward CV …")
             _buf = io.StringIO()
             with contextlib.redirect_stdout(_buf):
                 arima_res = tune_arima(series)
@@ -185,23 +187,8 @@ def _do_retrain_all() -> bool:
                 f"MAE = `{arima_res['mean_mae']:.6f} ± {arima_res['std_mae']:.6f}`"
             )
 
-            # ── SARIMAX ───────────────────────────────────────────────────
-            prog.progress(35, text="Tuning SARIMAX — AIC grid search …")
-            st.write("---")
-            st.write("🔍 **SARIMAX** — AIC pre-filter + walk-forward CV …")
-            _buf = io.StringIO()
-            with contextlib.redirect_stdout(_buf):
-                sarimax_res = tune_sarimax(series)
-            if _out := _buf.getvalue():
-                st.code(_out, language=None)
-            st.write(
-                f"✅ SARIMAX best: `order={sarimax_res['order']}  "
-                f"seasonal={sarimax_res['seasonal_order']}`  "
-                f"MAE = `{sarimax_res['mean_mae']:.6f} ± {sarimax_res['std_mae']:.6f}`"
-            )
-
             # ── Exponential Smoothing ─────────────────────────────────────
-            prog.progress(65, text="Tuning Exponential Smoothing …")
+            prog.progress(40, text="Tuning Exponential Smoothing …")
             st.write("---")
             st.write("🔍 **Exponential Smoothing** — walk-forward CV on all valid combos …")
             _buf = io.StringIO()
@@ -215,24 +202,51 @@ def _do_retrain_all() -> bool:
                 f"MAE = `{es_res['mean_mae']:.6f} ± {es_res['std_mae']:.6f}`"
             )
 
-            # ── Select best ───────────────────────────────────────────────
-            prog.progress(80, text="Selecting best model …")
+            # ── Naive ─────────────────────────────────────────────────────
+            prog.progress(65, text="Evaluating Naive baseline …")
             st.write("---")
-            best = compare_models(arima_res, sarimax_res, es_res)
+            st.write("🔍 **Naive** — walk-forward CV (last-value baseline) …")
+            _buf = io.StringIO()
+            with contextlib.redirect_stdout(_buf):
+                naive_res = tune_naive(series)
+            if _out := _buf.getvalue():
+                st.code(_out, language=None)
+            st.write(
+                f"✅ Naive: MAE = `{naive_res['mean_mae']:.6f} ± {naive_res['std_mae']:.6f}`"
+            )
+
+            # ── Naive+Drift ───────────────────────────────────────────────
+            prog.progress(75, text="Evaluating Naive+Drift baseline …")
+            st.write("---")
+            st.write("🔍 **Naive+Drift** — walk-forward CV (last value + mean drift) …")
+            _buf = io.StringIO()
+            with contextlib.redirect_stdout(_buf):
+                naive_drift_res = tune_naive_drift(series)
+            if _out := _buf.getvalue():
+                st.code(_out, language=None)
+            st.write(
+                f"✅ Naive+Drift: MAE = `{naive_drift_res['mean_mae']:.6f} ± {naive_drift_res['std_mae']:.6f}`"
+            )
+
+            # ── Select best ───────────────────────────────────────────────
+            prog.progress(83, text="Selecting best model …")
+            st.write("---")
+            best = compare_models(arima_res, es_res, naive_res, naive_drift_res)
             st.write(
                 f"🏆 **Best model: {best['model']}** — "
                 f"MAE = `{best['mean_mae']:.6f} ± {best['std_mae']:.6f}`"
             )
 
             # ── Fit & save ────────────────────────────────────────────────
-            prog.progress(85, text="Fitting all models on full series …")
+            prog.progress(87, text="Fitting all models on full series …")
             st.write("---")
             st.write("💾 Fitting and saving …")
             fitted_map: dict = {}
             for name, res in [
                 ("ARIMA", arima_res),
-                ("SARIMAX", sarimax_res),
                 ("ExponentialSmoothing", es_res),
+                ("Naive", naive_res),
+                ("NaiveDrift", naive_drift_res),
             ]:
                 fitted = fit_final_model(series, res)
                 fitted_map[name] = fitted
@@ -249,8 +263,9 @@ def _do_retrain_all() -> bool:
             # Save all_results.json
             all_results_payload = {
                 "ARIMA": _serialise(arima_res),
-                "SARIMAX": _serialise(sarimax_res),
                 "ExponentialSmoothing": _serialise(es_res),
+                "Naive": _serialise(naive_res),
+                "NaiveDrift": _serialise(naive_drift_res),
                 "best": _serialise(best),
                 "timestamp": timestamp,
                 "n_observations": len(series),
@@ -260,10 +275,13 @@ def _do_retrain_all() -> bool:
             st.write("  · `all_results.json` updated")
 
             # Diagnostics PNG
-            prog.progress(93, text="Generating diagnostic plots …")
+            prog.progress(94, text="Generating diagnostic plots …")
             all_results_dict = {
-                "ARIMA": arima_res, "SARIMAX": sarimax_res,
-                "ExponentialSmoothing": es_res, "best": best,
+                "ARIMA": arima_res,
+                "ExponentialSmoothing": es_res,
+                "Naive": naive_res,
+                "NaiveDrift": naive_drift_res,
+                "best": best,
             }
             with contextlib.redirect_stdout(io.StringIO()):
                 generate_all_plots(series, fitted_map[best["model"]], all_results_dict, OUTPUT_DIR)
@@ -289,7 +307,10 @@ def _do_retrain_all() -> bool:
 
 def _do_retrain_single(model_name: str) -> bool:
     """Retune one model with a live st.status progress panel."""
-    from core.models import load_series, tune_arima, tune_sarimax, tune_exp_smoothing, fit_final_model
+    from core.models import (
+        load_series, tune_arima, tune_exp_smoothing,
+        tune_naive, tune_naive_drift, fit_final_model,
+    )
     from core.pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR, MODEL_NAMES, _write_logs
 
     MODELS_DIR.mkdir(exist_ok=True)
@@ -315,8 +336,10 @@ def _do_retrain_single(model_name: str) -> bool:
             with contextlib.redirect_stdout(_buf):
                 if model_name == "ARIMA":
                     result = tune_arima(series)
-                elif model_name == "SARIMAX":
-                    result = tune_sarimax(series)
+                elif model_name == "Naive":
+                    result = tune_naive(series)
+                elif model_name == "NaiveDrift":
+                    result = tune_naive_drift(series)
                 else:
                     result = tune_exp_smoothing(series)
             if _out := _buf.getvalue():
@@ -392,6 +415,8 @@ def _params_short(r: dict) -> str:
         return f"order={tuple(r['order'])}"
     if name == "SARIMAX":
         return f"order={tuple(r['order'])}  seasonal={tuple(r['seasonal_order'])}"
+    if name in ("Naive", "NaiveDrift"):
+        return "—"
     return (
         f"trend={r.get('trend')}  seasonal={r.get('seasonal')}  "
         f"damped={r.get('damped_trend')}  sp={r.get('seasonal_periods')}"
@@ -747,10 +772,12 @@ def main() -> None:
         page_overview()
     elif page == "ARIMA":
         page_model("ARIMA")
-    elif page == "SARIMAX":
-        page_model("SARIMAX")
     elif page == "Exponential Smoothing":
         page_model("ExponentialSmoothing")
+    elif page == "Naive":
+        page_model("Naive")
+    elif page == "Naive + Drift":
+        page_model("NaiveDrift")
     elif page == "About":
         page_about()
 

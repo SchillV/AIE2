@@ -19,8 +19,9 @@ import pandas as pd
 from .models import (
     load_series,
     tune_arima,
-    tune_sarimax,
     tune_exp_smoothing,
+    tune_naive,
+    tune_naive_drift,
     compare_models,
     fit_final_model,
 )
@@ -35,11 +36,12 @@ OUTPUT_DIR = Path("resources") / "models"
 LOG_DIR = Path("logs")
 DEFAULT_CSV = str(Path("resources") / "data" / "idr_exchange_rates.csv")
 
-MODEL_NAMES = ["ARIMA", "SARIMAX", "ExponentialSmoothing"]
+MODEL_NAMES = ["ARIMA", "ExponentialSmoothing", "Naive", "NaiveDrift"]
 _PKL_PREFIX = {
     "ARIMA": "arima",
-    "SARIMAX": "sarimax",
     "ExponentialSmoothing": "exponentialsmoothing",
+    "Naive": "naive",
+    "NaiveDrift": "naivedrift",
 }
 
 
@@ -59,18 +61,22 @@ def _banner(text: str, width: int = 62) -> None:
 
 
 def _save_all_results(
-    arima: dict, sarimax: dict, es: dict, best: dict,
-    timestamp: str, n_obs: int,
+    results: dict,
+    best: dict,
+    timestamp: str,
+    n_obs: int,
 ) -> None:
+    """Persist all model results to all_results.json.
+
+    Args:
+        results: mapping of model_name → result dict for every trained model
+        best: the winning model result dict
+    """
     path = OUTPUT_DIR / "all_results.json"
-    payload = {
-        "ARIMA": _serialise(arima),
-        "SARIMAX": _serialise(sarimax),
-        "ExponentialSmoothing": _serialise(es),
-        "best": _serialise(best),
-        "timestamp": timestamp,
-        "n_observations": n_obs,
-    }
+    payload = {name: _serialise(res) for name, res in results.items() if name in MODEL_NAMES}
+    payload["best"] = _serialise(best)
+    payload["timestamp"] = timestamp
+    payload["n_observations"] = n_obs
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
     print(f"All results   → {path}")
@@ -233,21 +239,28 @@ def retrain_pipeline(csv_path: str = DEFAULT_CSV) -> dict:
     # Tune
     arima_res = tune_arima(series)
     print()
-    sarimax_res = tune_sarimax(series)
-    print()
     es_res = tune_exp_smoothing(series)
     print()
+    naive_res = tune_naive(series)
+    print()
+    naive_drift_res = tune_naive_drift(series)
+    print()
 
-    best = compare_models(arima_res, sarimax_res, es_res)
+    best = compare_models(arima_res, es_res, naive_res, naive_drift_res)
     _banner(
         f"Best model: {best['model']}  "
         f"MAE = {best['mean_mae']:.6f}  ±  {best['std_mae']:.6f}"
     )
 
-    # Fit all three on full series and save individual pickles
+    # Fit all models on full series and save individual pickles
     print("Fitting all models on full series and saving …")
     fitted_map: dict[str, object] = {}
-    for name, res in [("ARIMA", arima_res), ("SARIMAX", sarimax_res), ("ExponentialSmoothing", es_res)]:
+    for name, res in [
+        ("ARIMA", arima_res),
+        ("ExponentialSmoothing", es_res),
+        ("Naive", naive_res),
+        ("NaiveDrift", naive_drift_res),
+    ]:
         fitted = fit_final_model(series, res)
         fitted_map[name] = fitted
         _save_model_pkl(name, res, fitted, timestamp)
@@ -259,7 +272,13 @@ def retrain_pipeline(csv_path: str = DEFAULT_CSV) -> dict:
     print(f"Best model        → {best_path}")
 
     # Persist metadata
-    _save_all_results(arima_res, sarimax_res, es_res, best, timestamp, len(series))
+    all_results_by_name = {
+        "ARIMA": arima_res,
+        "ExponentialSmoothing": es_res,
+        "Naive": naive_res,
+        "NaiveDrift": naive_drift_res,
+    }
+    _save_all_results(all_results_by_name, best, timestamp, len(series))
 
     serialisable_best = _serialise(best)
     serialisable_best["timestamp"] = timestamp
@@ -272,8 +291,9 @@ def retrain_pipeline(csv_path: str = DEFAULT_CSV) -> dict:
     # Diagnostics PNG (combined, to resources/models/)
     all_results = {
         "ARIMA": arima_res,
-        "SARIMAX": sarimax_res,
         "ExponentialSmoothing": es_res,
+        "Naive": naive_res,
+        "NaiveDrift": naive_drift_res,
         "best": best,
     }
     print()
@@ -307,8 +327,10 @@ def retrain_single_model(model_name: str, csv_path: str = DEFAULT_CSV) -> dict:
 
     if model_name == "ARIMA":
         new_result = tune_arima(series)
-    elif model_name == "SARIMAX":
-        new_result = tune_sarimax(series)
+    elif model_name == "Naive":
+        new_result = tune_naive(series)
+    elif model_name == "NaiveDrift":
+        new_result = tune_naive_drift(series)
     else:
         new_result = tune_exp_smoothing(series)
 

@@ -33,46 +33,96 @@ def _normalise_params(params: dict) -> dict:
     return out
 
 
+def _trim_burnin(resid: pd.Series, model_result: dict) -> pd.Series:
+    """Drop Kalman-filter diffuse-init burn-in points from ARIMA/SARIMAX residuals.
+
+    The first ~d + D*s innovations are inflated by the diffuse prior and distort
+    the residual histogram and normal-fit overlay.  ES, Naive, and NaiveDrift have
+    no Kalman initialisation so their residuals are returned unchanged.
+    """
+    model_name = model_result.get("model", "")
+    if model_name not in ("ARIMA", "SARIMAX"):
+        return resid
+
+    order = model_result.get("order", [0, 0, 0])
+    d = int(order[1]) if len(order) >= 2 else 0
+
+    if model_name == "SARIMAX":
+        s_order = model_result.get("seasonal_order", [0, 0, 0, 1])
+        D = int(s_order[1]) if len(s_order) >= 2 else 0
+        s = int(s_order[3]) if len(s_order) >= 4 else 1
+        k = d + D * s
+    else:
+        k = d
+
+    k = max(k, 1)                   # always drop at least the first diffuse observation
+    k = min(k, len(resid) // 5)     # never discard more than 20 % of the series
+    return resid.iloc[k:]
+
+
 def _retroactive_forecast(
     series: pd.Series,
     model_params: dict,
     n_retro_days: int = 10,
     alpha: float = 0.05,
-    n_boot: int = 1000,
+    n_boot: int = 500,
 ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """
-    Fit model on series[:-n_retro_days], forecast n_retro_days steps ahead.
-    Returns (actual_test, pred_mean, lower_95, upper_95) all on test.index.
+    Rolling one-step-ahead retroactive forecast over the last n_retro_days.
+
+    For each day d in the test window the model is fitted on all data prior
+    to d and makes a single one-step prediction.  This mirrors walk-forward CV
+    so the plotted MAE is consistent with the reported CV MAE, and the
+    prediction line tracks the data rather than diverging as a multi-step fan.
+
+    ARIMA / SARIMAX: fit once on the initial training slice, then extend with
+    append(refit=False) — only the Kalman filter state is updated, so each
+    step is milliseconds rather than seconds.
+
+    ES / Naive / NaiveDrift: full refit per step (trivially fast).
+
+    Returns (actual_test, pred_mean, lower_95, upper_95) on test.index.
     """
     model_params = _normalise_params(model_params)
-    train = series.iloc[:-n_retro_days]
+    n = len(series)
     test = series.iloc[-n_retro_days:]
-    fitted = fit_final_model(train, model_params)
     model_name = model_params["model"]
 
-    if model_name in ("ARIMA", "SARIMAX"):
-        fc = fitted.get_forecast(steps=n_retro_days)
-        pred_mean = fc.predicted_mean
-        ci = fc.conf_int(alpha=alpha)
-        lower = ci.iloc[:, 0].values
-        upper = ci.iloc[:, 1].values
-    else:
-        pred_mean_values = fitted.forecast(steps=n_retro_days).values
-        residuals = fitted.resid.dropna().values
-        boots = np.stack(
-            [
-                pred_mean_values
-                + np.random.choice(residuals, size=n_retro_days, replace=True)
-                for _ in range(n_boot)
-            ]
-        )
-        lower = np.percentile(boots, 100 * alpha / 2, axis=0)
-        upper = np.percentile(boots, 100 * (1 - alpha / 2), axis=0)
-        pred_mean = pd.Series(pred_mean_values, index=test.index)
+    preds: list[float] = []
+    lowers: list[float] = []
+    uppers: list[float] = []
 
-    pred_s = pd.Series(np.asarray(pred_mean), index=test.index, name="Predicted")
-    lower_s = pd.Series(lower, index=test.index, name="Lower 95%")
-    upper_s = pd.Series(upper, index=test.index, name="Upper 95%")
+    if model_name in ("ARIMA", "SARIMAX"):
+        # Fit once; extend cheaply for each subsequent step.
+        fitted_i = fit_final_model(series.iloc[:n - n_retro_days], model_params)
+        for i in range(n_retro_days):
+            if i > 0:
+                new_obs = series.iloc[[n - n_retro_days + i - 1]]
+                fitted_i = fitted_i.append(new_obs, refit=False)
+            fc = fitted_i.get_forecast(steps=1)
+            preds.append(float(fc.predicted_mean.iloc[0]))
+            ci = fc.conf_int(alpha=alpha)
+            lowers.append(float(ci.iloc[0, 0]))
+            uppers.append(float(ci.iloc[0, 1]))
+    else:
+        # Full refit per step — fast for ES, trivial for Naive.
+        for i in range(n_retro_days):
+            train_i = series.iloc[:n - n_retro_days + i]
+            fitted_i = fit_final_model(train_i, model_params)
+            p = float(fitted_i.forecast(steps=1).iloc[0])
+            preds.append(p)
+            residuals = fitted_i.resid.dropna().values
+            if len(residuals) > 0:
+                boots = p + np.random.choice(residuals, size=n_boot, replace=True)
+                lowers.append(float(np.percentile(boots, 100 * alpha / 2)))
+                uppers.append(float(np.percentile(boots, 100 * (1 - alpha / 2))))
+            else:
+                lowers.append(p)
+                uppers.append(p)
+
+    pred_s = pd.Series(preds, index=test.index, name="Predicted")
+    lower_s = pd.Series(lowers, index=test.index, name="Lower 95%")
+    upper_s = pd.Series(uppers, index=test.index, name="Upper 95%")
     return test, pred_s, lower_s, upper_s
 
 
@@ -196,7 +246,7 @@ def make_per_model_diagnostic_figure(
     Does NOT save to disk — caller is responsible for display or saving.
     """
     model_name = model_result.get("model", "Model")
-    residuals = fitted_model.resid.dropna()
+    residuals = _trim_burnin(fitted_model.resid.dropna(), model_result)
     fold_maes = model_result.get("fold_maes", [])
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 8))
@@ -270,7 +320,7 @@ def _plot_diagnostics(
     gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
 
     best_name = all_results["best"]["model"]
-    residuals = fitted_model.resid.dropna()
+    residuals = _trim_burnin(fitted_model.resid.dropna(), all_results["best"])
 
     ax = fig.add_subplot(gs[0, 0])
     ax.hist(residuals, bins=40, density=True, alpha=0.72, color="#2c7bb6", edgecolor="white")
@@ -290,26 +340,32 @@ def _plot_diagnostics(
     ax.set_ylabel("Residual")
 
     ax = fig.add_subplot(gs[0, 2])
-    model_keys = ["ARIMA", "SARIMAX", "ExponentialSmoothing"]
-    palette = ["#2c7bb6", "#d7191c", "#1a9641"]
+    model_keys = ["ARIMA", "ExponentialSmoothing", "Naive", "NaiveDrift"]
+    palette = ["#2c7bb6", "#1a9641", "#984ea3", "#ff7f00"]
+    _short_label = {
+        "ExponentialSmoothing": "ES",
+        "NaiveDrift": "Drift",
+    }
     for key, color in zip(model_keys, palette):
         fold_maes = all_results.get(key, {}).get("fold_maes", [])
         if fold_maes:
-            ax.plot(range(1, len(fold_maes) + 1), fold_maes, marker="o", label=key, color=color)
+            label = _short_label.get(key, key)
+            ax.plot(range(1, len(fold_maes) + 1), fold_maes, marker="o", label=label, color=color)
     ax.set_title("MAE per CV Fold (all models)")
     ax.set_xlabel("CV Fold")
     ax.set_ylabel("MAE")
     ax.legend(fontsize=8)
 
     ax = fig.add_subplot(gs[1, 0])
-    short_names = ["ARIMA", "SARIMAX", "ES"]
+    short_names = [_short_label.get(k, k) for k in model_keys]
     mean_maes = [all_results.get(k, {}).get("mean_mae", np.nan) for k in model_keys]
     std_maes = [all_results.get(k, {}).get("std_mae", np.nan) for k in model_keys]
     bars = ax.bar(short_names, mean_maes, yerr=std_maes, capsize=6,
                   color=palette, alpha=0.82, edgecolor="black", linewidth=0.8)
-    winner_idx = model_keys.index(best_name)
-    bars[winner_idx].set_edgecolor("gold")
-    bars[winner_idx].set_linewidth(3)
+    if best_name in model_keys:
+        winner_idx = model_keys.index(best_name)
+        bars[winner_idx].set_edgecolor("gold")
+        bars[winner_idx].set_linewidth(3)
     ax.set_title("Mean MAE ± Std (best = gold border)")
     ax.set_ylabel("MAE")
 
