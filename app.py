@@ -373,7 +373,12 @@ def _sorted_models(all_results: dict) -> list[dict]:
 
 
 def _confirm_retrain_widget(key: str, label: str, action) -> None:
-    """Reusable confirm-before-retrain widget."""
+    """Reusable confirm-before-retrain widget.
+
+    The trigger button, warning, and confirm/cancel buttons are rendered here.
+    The action itself is deferred until *after* the column block closes so that
+    any st.status / st.progress panels it creates render at full page width.
+    """
     if st.button(label, key=f"btn_{key}"):
         st.session_state[f"pending_{key}"] = True
 
@@ -383,12 +388,17 @@ def _confirm_retrain_widget(key: str, label: str, action) -> None:
         with col_go:
             if st.button("✅ Confirm", key=f"confirm_{key}", use_container_width=True):
                 st.session_state[f"pending_{key}"] = False
-                action()
-                st.rerun()
+                st.session_state[f"run_{key}"] = True   # defer to outside the column
         with col_cancel:
             if st.button("✖ Cancel", key=f"cancel_{key}", use_container_width=True):
                 st.session_state[f"pending_{key}"] = False
                 st.rerun()
+
+    # Run action at full page width — outside the columns above.
+    if st.session_state.get(f"run_{key}"):
+        st.session_state[f"run_{key}"] = False
+        action()
+        st.rerun()
 
 
 # ─── Pages ───────────────────────────────────────────────────────────────────
@@ -425,12 +435,17 @@ def page_overview() -> None:
         with col_go:
             if st.button("✅ Confirm retrain", key="confirm_retrain_all", use_container_width=True):
                 st.session_state["pending_retrain_all"] = False
-                _do_retrain_all()
-                st.rerun()
+                st.session_state["do_retrain_all_now"] = True   # defer to full-width context
         with col_cancel:
             if st.button("✖ Cancel", key="cancel_retrain_all", use_container_width=True):
                 st.session_state["pending_retrain_all"] = False
                 st.rerun()
+
+    # Run at full page width — outside all columns above.
+    if st.session_state.get("do_retrain_all_now"):
+        st.session_state["do_retrain_all_now"] = False
+        _do_retrain_all()
+        st.rerun()
 
     st.divider()
 
@@ -636,13 +651,15 @@ Data updates and retraining can also be triggered directly from the **Overview**
     st.markdown("""
 | File | Purpose |
 |------|---------|
-| `main.py` | Scraper — POSTs to cursbnr.ro, saves `idr_exchange_rates.csv` |
+| `main.py` | Scraper — POSTs to cursbnr.ro, saves `resources/data/idr_exchange_rates.csv` |
 | `models.py` | Data loading (100 IDR scale), walk-forward CV, ARIMA/SARIMAX/ES tuning |
 | `pipeline.py` | CLI retraining pipeline + `retrain_single_model()` |
 | `visualize.py` | `make_forecast_figure()`, `make_per_model_diagnostic_figure()` |
 | `app.py` | This Streamlit application |
-| `trained_models/all_results.json` | Serialised results for all three models |
-| `trained_models/arima_*.pkl` | Per-model fitted objects |
+| `resources/data/idr_exchange_rates.csv` | Exchange-rate data fetched by `main.py` |
+| `resources/models/all_results.json` | CV results for all three models |
+| `resources/models/*_<timestamp>.pkl` | Per-model fitted objects |
+| `resources/models/diagnostics.png` | Combined diagnostic figure (CLI pipeline only) |
 """)
 
 
