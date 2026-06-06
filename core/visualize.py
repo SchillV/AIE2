@@ -219,14 +219,13 @@ def make_forecast_figure(
         xaxis=dict(
             title="Date",
             showgrid=True,
-            gridcolor="#e8e8e8",
+            gridcolor="rgba(128,128,128,0.2)",
             # hide weekend gaps so business-day data appears continuous
             rangebreaks=[dict(bounds=["sat", "mon"])],
         ),
-        yaxis=dict(title="100 IDR / RON", showgrid=True, gridcolor="#e8e8e8"),
+        yaxis=dict(title="100 IDR / RON", showgrid=True, gridcolor="rgba(128,128,128,0.2)"),
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        template="plotly_white",
         height=520, margin=dict(t=100),
     )
     return fig
@@ -640,7 +639,6 @@ def make_per_model_diagnostic_figure_plotly(
             x=0.5, font=dict(size=14),
         ),
         height=700,
-        template="plotly_white",
         showlegend=False,
     )
     fig.update_xaxes(title_text="Residual", row=1, col=1)

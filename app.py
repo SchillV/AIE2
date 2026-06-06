@@ -147,9 +147,9 @@ st.markdown("""
         border-radius: 6px;
         font-size: 0.92rem;
     }
-    /* Metric cards */
+    /* Metric cards — rgba background adapts to both light and dark mode */
     [data-testid="stMetric"] {
-        background: #f8f9fb;
+        background: rgba(128, 128, 128, 0.08);
         border-radius: 8px;
         padding: 0.6rem 0.8rem;
     }
