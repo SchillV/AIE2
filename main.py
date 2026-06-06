@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import csv
 import sys
+from pathlib import Path
 
 URL = "https://www.cursbnr.ro/curs-valutar-bnr"
 
@@ -21,7 +22,7 @@ PAYLOAD = {
     "dataStart": "22/02/2020",
 }
 
-OUTPUT_FILE = "idr_exchange_rates.csv"
+OUTPUT_FILE = Path("resources") / "data" / "idr_exchange_rates.csv"
 
 
 def fetch_exchange_rates() -> tuple[list[str], list[list[str]]]:
@@ -64,6 +65,7 @@ def save_to_csv(col_headers: list[str], rows: list[list[str]], filename: str) ->
         while len(col_headers) < max_cols:
             col_headers = col_headers + [f"col_{len(col_headers) + 1}"]
 
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
     with open(filename, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(col_headers)

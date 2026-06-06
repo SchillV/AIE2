@@ -1,6 +1,11 @@
 """
-Interactive Plotly forecast chart and matplotlib diagnostic panel
-for IDR/RON exchange rate predictions.
+Visualisation utilities for IDR/RON exchange rate forecasting.
+
+Public API
+----------
+make_forecast_figure()              → plotly Figure  (used by Streamlit app)
+make_per_model_diagnostic_figure()  → matplotlib Figure (used by Streamlit app)
+generate_all_plots()                → saves diagnostics.png  (used by CLI pipeline)
 """
 
 from pathlib import Path
@@ -16,24 +21,34 @@ from models import fit_final_model
 
 
 # --------------------------------------------------------------------------- #
-# Retroactive forecast helper                                                  #
+# Internal helpers                                                             #
 # --------------------------------------------------------------------------- #
+
+def _normalise_params(params: dict) -> dict:
+    """Ensure tuple fields are tuples (they become lists when round-tripped via JSON)."""
+    out = dict(params)
+    for key in ("order", "seasonal_order"):
+        if isinstance(out.get(key), list):
+            out[key] = tuple(out[key])
+    return out
+
 
 def _retroactive_forecast(
     series: pd.Series,
-    best_params: dict,
+    model_params: dict,
     n_retro_days: int = 10,
     alpha: float = 0.05,
     n_boot: int = 1000,
 ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """
-    Fit model on series[:-n_retro_days], forecast forward n_retro_days steps.
+    Fit model on series[:-n_retro_days], forecast n_retro_days steps ahead.
     Returns (actual_test, pred_mean, lower_95, upper_95) all on test.index.
     """
+    model_params = _normalise_params(model_params)
     train = series.iloc[:-n_retro_days]
     test = series.iloc[-n_retro_days:]
-    fitted = fit_final_model(train, best_params)
-    model_name = best_params["model"]
+    fitted = fit_final_model(train, model_params)
+    model_name = model_params["model"]
 
     if model_name in ("ARIMA", "SARIMAX"):
         fc = fitted.get_forecast(steps=n_retro_days)
@@ -41,8 +56,7 @@ def _retroactive_forecast(
         ci = fc.conf_int(alpha=alpha)
         lower = ci.iloc[:, 0].values
         upper = ci.iloc[:, 1].values
-
-    else:  # ExponentialSmoothing — bootstrap CI
+    else:
         pred_mean_values = fitted.forecast(steps=n_retro_days).values
         residuals = fitted.resid.dropna().values
         boots = np.stack(
@@ -59,113 +73,90 @@ def _retroactive_forecast(
     pred_s = pd.Series(np.asarray(pred_mean), index=test.index, name="Predicted")
     lower_s = pd.Series(lower, index=test.index, name="Lower 95%")
     upper_s = pd.Series(upper, index=test.index, name="Upper 95%")
-
     return test, pred_s, lower_s, upper_s
 
 
 # --------------------------------------------------------------------------- #
-# Interactive Plotly chart                                                     #
+# Public: interactive Plotly forecast chart                                   #
 # --------------------------------------------------------------------------- #
 
-def plot_interactive_forecast(
+def make_forecast_figure(
     series: pd.Series,
-    all_results: dict,
+    model_params: dict,
     n_history_days: int = 44,
     n_retro_days: int = 10,
-    output_html: str = "forecast.html",
 ) -> go.Figure:
     """
-    Interactive chart:
-      - Blue line  : historical data (last ~2 months)
-      - Green line : actual values for the retroactive 2-week window
-      - Orange band: 95% confidence interval
-      - Orange dash: retroactive model prediction
-    """
-    best_params = all_results["best"]
-    test, pred, lower, upper = _retroactive_forecast(series, best_params, n_retro_days)
+    Build and return an interactive Plotly figure (does NOT save to disk).
 
-    # Historical slice excludes the retroactive window
-    history_end = series.index[-n_retro_days - 1]
-    history_start_idx = max(0, len(series) - n_history_days - n_retro_days)
-    history = series.iloc[history_start_idx : len(series) - n_retro_days]
+    Traces
+    ------
+    - Blue solid   : historical data (last ~2 months)
+    - Orange dashed: retroactive model prediction (last 2 weeks)
+    - Orange band  : 95% confidence interval
+    - Green solid  : actual values for the retroactive window
+    """
+    if len(series) <= n_retro_days:
+        raise ValueError(
+            f"Series too short ({len(series)} obs) for a {n_retro_days}-day retroactive window."
+        )
+
+    model_params = _normalise_params(model_params)
+    _test, pred, lower, upper = _retroactive_forecast(series, model_params, n_retro_days)
+
+    # History spans the full window (pre-retro + retro) so there is no gap.
+    # The prediction is overlaid on the retroactive slice.
+    history_start = max(0, len(series) - n_history_days - n_retro_days)
+    history = series.iloc[history_start:]
+
+    retro_start_str = str(series.index[-n_retro_days])
+    retro_end_str   = str(series.index[-1])
 
     fig = go.Figure()
 
-    # Historical data
-    fig.add_trace(
-        go.Scatter(
-            x=history.index,
-            y=history.values,
-            mode="lines",
-            name="Historical (last 2 months)",
-            line=dict(color="#2c7bb6", width=2),
-        )
-    )
-
-    # 95% CI band (drawn before the prediction line so it sits behind)
-    fig.add_trace(
-        go.Scatter(
-            x=list(pred.index) + list(pred.index[::-1]),
-            y=list(upper.values) + list(lower.values[::-1]),
-            fill="toself",
-            fillcolor="rgba(255, 127, 14, 0.20)",
-            line=dict(color="rgba(0,0,0,0)"),
-            name="95% Confidence Interval",
-            hoverinfo="skip",
-        )
-    )
-
-    # Retroactive prediction
-    fig.add_trace(
-        go.Scatter(
-            x=pred.index,
-            y=pred.values,
-            mode="lines+markers",
-            name=f"Predicted – {best_params['model']}",
-            line=dict(color="#ff7f0e", width=2, dash="dash"),
-            marker=dict(size=6, symbol="circle-open"),
-        )
-    )
-
-    # Actual values for the retroactive window
-    fig.add_trace(
-        go.Scatter(
-            x=test.index,
-            y=test.values,
-            mode="lines+markers",
-            name="Actual (retroactive period)",
-            line=dict(color="#1a9641", width=2),
-            marker=dict(size=6),
-        )
-    )
-
-    # Separator line at the start of the retroactive window
-    # (add_vline with annotations fails on datetime axes in recent plotly/pandas;
-    #  use add_shape + add_annotation instead)
-    separator_x = str(history.index[-1])
+    # Shaded background for the retroactive window (drawn first, sits behind everything)
     fig.add_shape(
-        type="line",
-        x0=separator_x,
-        x1=separator_x,
-        y0=0,
-        y1=1,
-        yref="paper",
-        line=dict(color="#888888", width=1, dash="dot"),
+        type="rect",
+        x0=retro_start_str, x1=retro_end_str,
+        y0=0, y1=1, yref="paper",
+        fillcolor="rgba(255, 127, 14, 0.07)",
+        line_width=0, layer="below",
     )
     fig.add_annotation(
-        x=separator_x,
-        y=1,
-        yref="paper",
-        text="Retroactive window",
-        showarrow=False,
-        xanchor="left",
-        yanchor="bottom",
+        x=retro_start_str, y=1, yref="paper",
+        text="Retroactive window", showarrow=False,
+        xanchor="left", yanchor="bottom",
         font=dict(size=11, color="#888888"),
     )
 
-    mae = best_params["mean_mae"]
-    std_mae = best_params["std_mae"]
-    model_label = best_params["model"]
+    # Continuous historical + actual line (no gap)
+    fig.add_trace(go.Scatter(
+        x=history.index, y=history.values,
+        mode="lines", name="Actual rate",
+        line=dict(color="#2c7bb6", width=2),
+    ))
+
+    # CI band (behind prediction line)
+    fig.add_trace(go.Scatter(
+        x=list(pred.index) + list(pred.index[::-1]),
+        y=list(upper.values) + list(lower.values[::-1]),
+        fill="toself", fillcolor="rgba(255,127,14,0.20)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="95% Confidence Interval", hoverinfo="skip",
+    ))
+
+    # Retroactive prediction overlaid on the retro window
+    fig.add_trace(go.Scatter(
+        x=pred.index, y=pred.values,
+        mode="lines+markers",
+        name=f"Predicted – {model_params['model']}",
+        line=dict(color="#ff7f0e", width=2, dash="dash"),
+        marker=dict(size=6, symbol="circle-open"),
+    ))
+
+    mae = model_params["mean_mae"]
+    std_mae = model_params["std_mae"]
+    model_label = model_params["model"]
 
     fig.update_layout(
         title=dict(
@@ -173,25 +164,100 @@ def plot_interactive_forecast(
                 f"IDR/RON Exchange Rate – {model_label} Retroactive Forecast<br>"
                 f"<sup>CV MAE = {mae:.6f}  ±  {std_mae:.6f}</sup>"
             ),
-            x=0.5,
-            font=dict(size=16),
+            x=0.5, font=dict(size=16),
         ),
-        xaxis=dict(title="Date", showgrid=True, gridcolor="#e8e8e8"),
-        yaxis=dict(title="IDR / RON Rate", showgrid=True, gridcolor="#e8e8e8"),
+        xaxis=dict(
+            title="Date",
+            showgrid=True,
+            gridcolor="#e8e8e8",
+            # hide weekend gaps so business-day data appears continuous
+            rangebreaks=[dict(bounds=["sat", "mon"])],
+        ),
+        yaxis=dict(title="100 IDR / RON", showgrid=True, gridcolor="#e8e8e8"),
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         template="plotly_white",
-        height=560,
-        margin=dict(t=100),
+        height=520, margin=dict(t=100),
     )
-
-    fig.write_html(output_html)
-    print(f"Interactive chart saved → {output_html}")
     return fig
 
 
 # --------------------------------------------------------------------------- #
-# Matplotlib diagnostic panel                                                  #
+# Public: per-model diagnostic matplotlib figure                              #
+# --------------------------------------------------------------------------- #
+
+def make_per_model_diagnostic_figure(
+    series: pd.Series,
+    fitted_model,
+    model_result: dict,
+) -> plt.Figure:
+    """
+    Return a 2×2 matplotlib Figure with diagnostics for a single model.
+    Does NOT save to disk — caller is responsible for display or saving.
+    """
+    model_name = model_result.get("model", "Model")
+    residuals = fitted_model.resid.dropna()
+    fold_maes = model_result.get("fold_maes", [])
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    fig.subplots_adjust(hspace=0.45, wspace=0.35)
+
+    # ── (0,0) Residuals histogram ──────────────────────────────────────────
+    ax = axes[0, 0]
+    ax.hist(residuals, bins=40, density=True, alpha=0.72, color="#2c7bb6", edgecolor="white")
+    x_range = np.linspace(residuals.min(), residuals.max(), 300)
+    ax.plot(x_range, stats.norm.pdf(x_range, residuals.mean(), residuals.std()),
+            "r-", lw=2, label="Normal fit")
+    ax.set_title("Residuals Distribution")
+    ax.set_xlabel("Residual")
+    ax.set_ylabel("Density")
+    ax.legend()
+
+    # ── (0,1) Residuals over time ─────────────────────────────────────────
+    ax = axes[0, 1]
+    ax.plot(residuals.index, residuals.values, color="#2c7bb6", lw=1, alpha=0.8)
+    ax.axhline(0, color="red", linestyle="--", lw=1.2)
+    ax.set_title("Residuals Over Time")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Residual")
+
+    # ── (1,0) MAE per CV fold ─────────────────────────────────────────────
+    ax = axes[1, 0]
+    if fold_maes:
+        folds = range(1, len(fold_maes) + 1)
+        ax.bar(folds, fold_maes, color="#2c7bb6", alpha=0.8, edgecolor="black", linewidth=0.6)
+        ax.axhline(np.mean(fold_maes), color="red", linestyle="--", lw=1.5,
+                   label=f"Mean = {np.mean(fold_maes):.6f}")
+        ax.set_title("MAE per CV Fold")
+        ax.set_xlabel("Fold")
+        ax.set_ylabel("MAE")
+        ax.legend(fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "No CV data", ha="center", va="center", transform=ax.transAxes)
+
+    # ── (1,1) Actual vs Predicted (in-sample, last 100) ───────────────────
+    ax = axes[1, 1]
+    try:
+        fitted_vals = fitted_model.fittedvalues.dropna().iloc[-100:]
+        actual_vals = series.loc[fitted_vals.index]
+        ax.scatter(actual_vals, fitted_vals, alpha=0.45, s=14, color="#2c7bb6")
+        lo = min(actual_vals.min(), fitted_vals.min())
+        hi = max(actual_vals.max(), fitted_vals.max())
+        ax.plot([lo, hi], [lo, hi], "r--", lw=1.5, label="Perfect fit")
+        ax.set_title("Actual vs Predicted (in-sample, last 100)")
+        ax.set_xlabel("Actual")
+        ax.set_ylabel("Predicted")
+        ax.legend()
+    except Exception as exc:
+        ax.text(0.5, 0.5, f"Could not plot:\n{exc}", ha="center", va="center",
+                transform=ax.transAxes, fontsize=8)
+
+    fig.suptitle(f"{model_name} – Diagnostic Plots", fontsize=13, fontweight="bold")
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Private: combined all-models diagnostic panel (CLI pipeline only)           #
 # --------------------------------------------------------------------------- #
 
 def _plot_diagnostics(
@@ -206,23 +272,16 @@ def _plot_diagnostics(
     best_name = all_results["best"]["model"]
     residuals = fitted_model.resid.dropna()
 
-    # ── (0,0) Residuals histogram ──────────────────────────────────────────
     ax = fig.add_subplot(gs[0, 0])
     ax.hist(residuals, bins=40, density=True, alpha=0.72, color="#2c7bb6", edgecolor="white")
     x_range = np.linspace(residuals.min(), residuals.max(), 300)
-    ax.plot(
-        x_range,
-        stats.norm.pdf(x_range, residuals.mean(), residuals.std()),
-        "r-",
-        lw=2,
-        label="Normal fit",
-    )
+    ax.plot(x_range, stats.norm.pdf(x_range, residuals.mean(), residuals.std()),
+            "r-", lw=2, label="Normal fit")
     ax.set_title(f"Residuals Distribution ({best_name})")
     ax.set_xlabel("Residual")
     ax.set_ylabel("Density")
     ax.legend()
 
-    # ── (0,1) Residuals over time ─────────────────────────────────────────
     ax = fig.add_subplot(gs[0, 1])
     ax.plot(residuals.index, residuals.values, color="#2c7bb6", lw=1, alpha=0.8)
     ax.axhline(0, color="red", linestyle="--", lw=1.2)
@@ -230,7 +289,6 @@ def _plot_diagnostics(
     ax.set_xlabel("Date")
     ax.set_ylabel("Residual")
 
-    # ── (0,2) MAE per CV fold — all models ────────────────────────────────
     ax = fig.add_subplot(gs[0, 2])
     model_keys = ["ARIMA", "SARIMAX", "ExponentialSmoothing"]
     palette = ["#2c7bb6", "#d7191c", "#1a9641"]
@@ -243,29 +301,18 @@ def _plot_diagnostics(
     ax.set_ylabel("MAE")
     ax.legend(fontsize=8)
 
-    # ── (1,0) Model comparison bar chart ──────────────────────────────────
     ax = fig.add_subplot(gs[1, 0])
     short_names = ["ARIMA", "SARIMAX", "ES"]
     mean_maes = [all_results.get(k, {}).get("mean_mae", np.nan) for k in model_keys]
     std_maes = [all_results.get(k, {}).get("std_mae", np.nan) for k in model_keys]
-    bars = ax.bar(
-        short_names,
-        mean_maes,
-        yerr=std_maes,
-        capsize=6,
-        color=palette,
-        alpha=0.82,
-        edgecolor="black",
-        linewidth=0.8,
-    )
-    # Gold border for winner
+    bars = ax.bar(short_names, mean_maes, yerr=std_maes, capsize=6,
+                  color=palette, alpha=0.82, edgecolor="black", linewidth=0.8)
     winner_idx = model_keys.index(best_name)
     bars[winner_idx].set_edgecolor("gold")
     bars[winner_idx].set_linewidth(3)
     ax.set_title("Mean MAE ± Std (best = gold border)")
     ax.set_ylabel("MAE")
 
-    # ── (1,1) Actual vs Predicted scatter (last 100 in-sample) ────────────
     ax = fig.add_subplot(gs[1, 1])
     try:
         fitted_vals = fitted_model.fittedvalues.dropna().iloc[-100:]
@@ -279,9 +326,9 @@ def _plot_diagnostics(
         ax.set_ylabel("Predicted")
         ax.legend()
     except Exception as exc:
-        ax.text(0.5, 0.5, f"Could not plot:\n{exc}", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.5, f"Could not plot:\n{exc}", ha="center", va="center",
+                transform=ax.transAxes)
 
-    # ── (1,2) Cumulative mean MAE across folds (best model) ───────────────
     ax = fig.add_subplot(gs[1, 2])
     fold_maes = all_results["best"].get("fold_maes", [])
     if fold_maes:
@@ -294,12 +341,8 @@ def _plot_diagnostics(
     else:
         ax.text(0.5, 0.5, "No fold data", ha="center", va="center", transform=ax.transAxes)
 
-    fig.suptitle(
-        "IDR/RON Exchange Rate – Model Diagnostic Plots",
-        fontsize=14,
-        fontweight="bold",
-        y=1.01,
-    )
+    fig.suptitle("IDR/RON Exchange Rate – Model Diagnostic Plots",
+                 fontsize=14, fontweight="bold", y=1.01)
 
     out = output_dir / "diagnostics.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -308,7 +351,7 @@ def _plot_diagnostics(
 
 
 # --------------------------------------------------------------------------- #
-# Public entry point                                                           #
+# Public entry point (CLI pipeline)                                           #
 # --------------------------------------------------------------------------- #
 
 def generate_all_plots(
@@ -317,7 +360,6 @@ def generate_all_plots(
     all_results: dict,
     output_dir: str | Path = ".",
 ) -> None:
-    """Generate the interactive Plotly chart and all matplotlib diagnostic plots."""
+    """Save the combined all-models diagnostic PNG. (forecast.html is now served by the app.)"""
     output_dir = Path(output_dir)
-    plot_interactive_forecast(series, all_results, output_html=str(output_dir / "forecast.html"))
     _plot_diagnostics(series, fitted_model, all_results, output_dir)

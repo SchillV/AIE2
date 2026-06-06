@@ -98,6 +98,9 @@ def load_series(csv_path: str | Path) -> pd.Series:
     series = df[rate_col].rename("IDR_RON")
     # Keep the last entry per date in case the source has duplicate rows
     series = series.groupby(series.index).last()
+    # Express as "100 IDR → RON" (more readable than the raw per-unit value)
+    series = series * 100
+    series.name = "100IDR_RON"
     series = series.asfreq("B").ffill()
     return series
 
