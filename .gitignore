@@ -12,6 +12,12 @@ __pycache__/
 forecast.html
 diagnostics.png
 
+# ── Local LLM model files ─────────────────────────────────────────────────────
+# GGUF weights or any manually downloaded model binaries
+*.gguf
+*.bin
+resources/llm/
+
 # ── Virtual environments ──────────────────────────────────────────────────────
 .venv/
 venv/

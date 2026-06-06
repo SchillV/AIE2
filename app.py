@@ -26,6 +26,15 @@ CSV_PATH = Path("resources") / "data" / "idr_exchange_rates.csv"
 MODELS_DIR = Path("resources") / "models"
 ALL_RESULTS_PATH = MODELS_DIR / "all_results.json"
 PLAN_PATH = Path("plan_implementare_antrenare_modele.md")
+SETTINGS_PATH = Path("resources") / "settings.json"
+
+# Keys that are persisted to disk; values are the defaults.
+_SETTINGS_KEYS: dict = {
+    "chat_backend": "claude",
+    "chat_claude_model": "claude-sonnet-4-6",
+    "chat_claude_key": "",
+    "chat_ollama_model": "llama3.2",
+}
 
 MODEL_NAMES = ["ARIMA", "ExponentialSmoothing", "Naive", "NaiveDrift"]
 _PKL_PREFIX = {
@@ -40,7 +49,7 @@ _DISPLAY = {
     "Naive": "Naive (last value)",
     "NaiveDrift": "Naive + Drift",
 }
-_PAGES = ["Overview", "ARIMA", "Exponential Smoothing", "Naive", "Naive + Drift", "About"]
+_PAGES = ["Overview", "ARIMA", "Exponential Smoothing", "Naive", "Naive + Drift", "Chatbot", "Settings", "About"]
 
 _MODEL_DESCRIPTION = {
     "ARIMA": """\
@@ -210,6 +219,38 @@ def _clear_caches() -> None:
     _cached_load_series.clear()
     _cached_load_results.clear()
     _cached_load_pkl.clear()
+
+
+def _load_settings() -> None:
+    """Read persisted settings into session_state on first load."""
+    saved: dict = {}
+    if SETTINGS_PATH.exists():
+        try:
+            with open(SETTINGS_PATH) as fh:
+                saved = json.load(fh)
+        except Exception:
+            pass
+    for key, default in _SETTINGS_KEYS.items():
+        if key not in st.session_state:
+            st.session_state[key] = saved.get(key, default)
+
+
+def _save_settings() -> None:
+    """Persist current settings to disk (used as on_change callback for settings widgets)."""
+    data = {k: st.session_state.get(k, v) for k, v in _SETTINGS_KEYS.items()}
+    try:
+        SETTINGS_PATH.parent.mkdir(exist_ok=True)
+        with open(SETTINGS_PATH, "w") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _ollama_status() -> tuple[bool, list[str]]:
+    from core.chatbot import is_ollama_running, list_ollama_models
+    running = is_ollama_running()
+    return running, (list_ollama_models() if running else [])
 
 
 # ─── Action helpers ──────────────────────────────────────────────────────────
@@ -822,11 +863,373 @@ Data updates and retraining can also be triggered directly from the **Overview**
 """)
 
 
+# ─── Chatbot helpers ──────────────────────────────────────────────────────────
+
+def _chat_messages() -> list:
+    """Return (and initialise) the shared chat message history."""
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+    return st.session_state["chat_messages"]
+
+
+def _render_chat_action(action: dict, series, all_results) -> None:
+    """Render a display action produced by the chatbot inside a chat bubble."""
+    action_type = action.get("type")
+    model_name = action.get("model_name", "")
+
+    if action_type == "show_forecast":
+        if series is None or all_results is None:
+            st.warning("No data/models available to render chart.")
+            return
+        result = all_results.get(model_name)
+        if result is None:
+            st.warning(f"No results for {model_name}.")
+            return
+        from core.visualize import make_forecast_figure
+        try:
+            fig = make_forecast_figure(series, _normalise_params(result))
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as exc:
+            st.error(f"Chart error: {exc}")
+
+    elif action_type == "show_comparison":
+        if all_results is None:
+            st.warning("No model results available.")
+            return
+        sorted_models = _sorted_models(all_results)
+        best_name = all_results.get("best", {}).get("model", "")
+        rows = []
+        for rank, r in enumerate(sorted_models, 1):
+            name = r["model"]
+            rows.append({
+                "Rank": f"{'★ ' if name == best_name else ''}#{rank}",
+                "Model": _DISPLAY.get(name, name),
+                "Mean CV MAE": f"{r['mean_mae']:.6f}",
+                "Std CV MAE": f"{r['std_mae']:.6f}",
+                "Best Params": _params_short(r),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    elif action_type == "show_diagnostics":
+        pkl_data = _get_model_pkl(model_name)
+        if pkl_data is None or all_results is None:
+            st.warning(f"No saved model pickle for {model_name}.")
+            return
+        fitted = pkl_data.get("fitted")
+        result = all_results.get(model_name)
+        if fitted is None or result is None:
+            st.warning("Pickle exists but model object missing.")
+            return
+        from core.visualize import make_per_model_diagnostic_figure_plotly
+        try:
+            fig = make_per_model_diagnostic_figure_plotly(series, fitted, result)
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as exc:
+            st.error(f"Diagnostic plot error: {exc}")
+
+
+def _on_active_model_change() -> None:
+    """on_change callback for the combined model selectbox in the chatbot page."""
+    from core.chatbot import CLAUDE_MODELS
+    model = st.session_state.get("chat_active_model", "")
+    if model in CLAUDE_MODELS:
+        st.session_state["chat_backend"] = "claude"
+        st.session_state["chat_claude_model"] = model
+    else:
+        st.session_state["chat_backend"] = "ollama"
+        st.session_state["chat_ollama_model"] = model
+    _save_settings()
+
+
+def _build_api_messages(chat_msgs: list) -> list[dict]:
+    """Convert ChatMessage list → plain dicts for API calls."""
+    return [{"role": m["role"], "content": m["content"]} for m in chat_msgs]
+
+
+def _send_chat(
+    user_text: str,
+    series,
+    all_results,
+) -> None:
+    """
+    Append user message, call selected LLM backend, append assistant response.
+    All state lives in st.session_state.
+    """
+    from core.chatbot import (
+        build_app_context, get_response_claude, get_response_ollama,
+        DEFAULT_CLAUDE_MODEL, DEFAULT_OLLAMA_MODEL, execute_run_action,
+    )
+
+    messages = _chat_messages()
+    messages.append({"role": "user", "content": user_text, "actions": []})
+
+    system = build_app_context(series, all_results)
+    api_msgs = _build_api_messages(messages)
+
+    backend = st.session_state.get("chat_backend", "claude")
+
+    with st.spinner("Working …"):
+        if backend == "claude":
+            api_key = st.session_state.get("chat_claude_key", "")
+            model = st.session_state.get("chat_claude_model", DEFAULT_CLAUDE_MODEL)
+            if not api_key:
+                response_text = (
+                    "No Claude API key provided. "
+                    "Go to **Settings** to enter your API key, or switch to a local model."
+                )
+                response_actions: list = []
+            else:
+                resp = get_response_claude(
+                    api_msgs, system, api_key, model, series, all_results
+                )
+                response_text = resp.text
+                response_actions = resp.actions
+        else:
+            model = st.session_state.get("chat_ollama_model", DEFAULT_OLLAMA_MODEL)
+            resp = get_response_ollama(
+                api_msgs, system, model, series, all_results
+            )
+            response_text = resp.text
+            response_actions = resp.actions
+
+    # Split actions: display ones persist in history; execute ones run once and are discarded.
+    display_actions = [
+        a for a in response_actions
+        if not a.get("type", "").startswith(("run_", "did_"))
+    ]
+    run_actions = [
+        a for a in response_actions
+        if a.get("type", "").startswith(("run_", "did_"))
+    ]
+
+    # Hallucination guard (Claude only): if no tool action was emitted but the user asked
+    # for data to be fetched and data is still absent, the model responded in text only.
+    if backend == "claude" and not run_actions and series is None:
+        _fetch_keywords = ("fetch", "download", "scrape", "get data", "update data", "retrieve")
+        if any(kw in user_text.lower() for kw in _fetch_keywords):
+            response_text += (
+                "\n\n> ⚠️ **Note:** No fetch tool was called during this response. "
+                "If you intended to download exchange-rate data, please ask again — "
+                "e.g. *\"Please fetch the BNR data now.\"*"
+            )
+
+    # Execute pending actions (Ollama path); Claude already ran them inside _execute_tool.
+    execution_notes: list[str] = []
+    for action in run_actions:
+        if action.get("type", "").startswith("run_"):
+            note = execute_run_action(action)
+            if note:
+                execution_notes.append(note)
+
+    if run_actions:
+        _clear_caches()
+        # Re-read after action so we can confirm what actually changed in the app
+        fresh_series = _get_series()
+        if fresh_series is not None and series is None:
+            # Data was absent before; confirm it's now loaded
+            first = fresh_series.index[0].date()
+            last = fresh_series.index[-1].date()
+            execution_notes.append(
+                f"**Data is now available in the app** — "
+                f"{len(fresh_series):,} observations ({first} → {last})."
+            )
+
+    if execution_notes:
+        suffix = "\n\n" + "\n\n".join(execution_notes)
+        response_text = (response_text + suffix).strip() if response_text else suffix.strip()
+
+    messages.append({
+        "role": "assistant",
+        "content": response_text,
+        "actions": display_actions,
+    })
+
+
+def page_chatbot() -> None:
+    from core.chatbot import CLAUDE_MODELS, DEFAULT_OLLAMA_MODEL
+
+    series = _get_series()
+    all_results = _get_all_results()
+    messages = _chat_messages()
+
+    st.title("Chatbot")
+    st.caption(
+        "Answers are based only on the data loaded in this app. "
+        "Configure the LLM backend in **Settings**."
+    )
+
+    # ── Message history ───────────────────────────────────────────────────────
+    for msg in messages:
+        with st.chat_message(msg["role"]):
+            if msg["content"]:
+                st.markdown(msg["content"])
+            for action in msg.get("actions", []):
+                _render_chat_action(action, series, all_results)
+
+    # ── Action row (regenerate / clear) ──────────────────────────────────────
+    if messages:
+        regen_col, clear_col, _ = st.columns([1, 1, 6])
+        with regen_col:
+            regen_clicked = st.button("↺ Retry", key="btn_regen", use_container_width=True,
+                                      help="Remove the last response and generate a new one")
+        with clear_col:
+            if st.button("🗑 Clear", key="btn_clear_chat", use_container_width=True):
+                st.session_state["chat_messages"] = []
+                st.rerun()
+
+        if regen_clicked and len(messages) >= 2 and messages[-1]["role"] == "assistant":
+            messages.pop()                     # remove assistant message
+            last_user = messages.pop()         # remove user message (will be re-added)
+            _send_chat(last_user["content"], series, all_results)
+            st.rerun()
+
+    # ── Quick model selector ──────────────────────────────────────────────────
+    _, installed = _ollama_status()
+    ollama_models = installed if installed else [DEFAULT_OLLAMA_MODEL]
+    all_models = CLAUDE_MODELS + ollama_models
+
+    # Derive the currently active model from backend + specific model keys.
+    backend = st.session_state.get("chat_backend", "claude")
+    current_model = (
+        st.session_state.get("chat_claude_model", CLAUDE_MODELS[0])
+        if backend == "claude"
+        else st.session_state.get("chat_ollama_model", ollama_models[0])
+    )
+    if st.session_state.get("chat_active_model") not in all_models:
+        st.session_state["chat_active_model"] = (
+            current_model if current_model in all_models else all_models[0]
+        )
+
+    sel_col, _ = st.columns([2, 6])
+    with sel_col:
+        st.selectbox(
+            "Model",
+            options=all_models,
+            format_func=lambda m: f"Claude › {m}" if m in CLAUDE_MODELS else m,
+            key="chat_active_model",
+            label_visibility="collapsed",
+            on_change=_on_active_model_change,
+        )
+
+    # ── Chat input ────────────────────────────────────────────────────────────
+    if prompt := st.chat_input(
+        "Ask about exchange rates, models, forecasts …",
+        key="chatbot_page_input",
+    ):
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        _send_chat(prompt, series, all_results)
+        last = messages[-1] if messages else None
+        if last and last["role"] == "assistant":
+            with st.chat_message("assistant"):
+                if last["content"]:
+                    st.markdown(last["content"])
+                for action in last.get("actions", []):
+                    _render_chat_action(action, series, all_results)
+
+
+def page_settings() -> None:
+    from core.chatbot import CLAUDE_MODELS, DEFAULT_OLLAMA_MODEL, download_ollama_model
+
+    st.title("Settings")
+
+    # ── Chat / LLM ────────────────────────────────────────────────────────────
+    st.subheader("Chat")
+    st.radio(
+        "LLM Backend",
+        options=["claude", "ollama"],
+        format_func=lambda x: "Claude (Anthropic API)" if x == "claude" else "Local model (Ollama)",
+        key="chat_backend",
+        horizontal=True,
+        on_change=_save_settings,
+    )
+    st.divider()
+
+    if st.session_state.get("chat_backend", "claude") == "claude":
+        st.markdown(
+            "**Getting an API key**  \n"
+            "Sign in at [console.anthropic.com](https://console.anthropic.com), open "
+            "**API Keys** in the left sidebar, and click **Create Key**. "
+            "Keys start with `sk-ant-…`.  \n"
+            "Your key is saved to `resources/settings.json` on this machine "
+            "and is not included in git."
+        )
+        k1, k2 = st.columns([2, 1])
+        with k1:
+            st.text_input(
+                "API Key",
+                type="password",
+                key="chat_claude_key",
+                placeholder="sk-ant-…",
+                on_change=_save_settings,
+            )
+        with k2:
+            st.selectbox(
+                "Model",
+                options=CLAUDE_MODELS,
+                key="chat_claude_model",
+                on_change=_save_settings,
+            )
+    else:
+        ollama_running, installed = _ollama_status()
+        if ollama_running:
+            st.success("Ollama is running.")
+        else:
+            st.warning(
+                "Ollama is not reachable. Start it with `ollama serve`, "
+                "or install it from [ollama.com](https://ollama.com)."
+            )
+        model_options = installed if installed else [DEFAULT_OLLAMA_MODEL]
+        st.selectbox(
+            "Model",
+            options=model_options,
+            key="chat_ollama_model",
+            on_change=_save_settings,
+        )
+
+        st.divider()
+        st.subheader("Download a model")
+        st.caption(
+            "Enter any model name from [ollama.com/search](https://ollama.com/search). "
+            "Examples: `llama3.2`, `mistral`, `phi4`."
+        )
+        p1, p2 = st.columns([3, 1])
+        with p1:
+            st.text_input(
+                "Model name",
+                key="_ollama_pull_input",
+                placeholder=DEFAULT_OLLAMA_MODEL,
+                label_visibility="collapsed",
+            )
+        with p2:
+            pull_clicked = st.button("⬇ Pull", key="btn_pull_model", use_container_width=True)
+
+        if pull_clicked:
+            pull_name = (
+                st.session_state.get("_ollama_pull_input", "").strip() or DEFAULT_OLLAMA_MODEL
+            )
+            status_msg = st.empty()
+            status_msg.info(f"Pulling `{pull_name}` …")
+            pull_lines: list[str] = []
+            with st.container(height=220):
+                output_area = st.empty()
+            for line in download_ollama_model(pull_name):
+                pull_lines.append(line)
+                output_area.code("\n".join(pull_lines[-60:]), language=None)
+            if any(ln.startswith("[DONE]") for ln in pull_lines):
+                status_msg.success(f"✅ `{pull_name}` downloaded. Reload the page to use it.")
+                _ollama_status.clear()
+            else:
+                status_msg.error("Download failed — see output above.")
+
+
 # ─── Sidebar navigation ───────────────────────────────────────────────────────
 
 def main() -> None:
     if "page" not in st.session_state:
         st.session_state["page"] = "Overview"
+    if "chat_backend" not in st.session_state:
+        _load_settings()
 
     with st.sidebar:
         st.markdown("## 📈 IDR/RON Forecaster")
@@ -857,6 +1260,33 @@ def main() -> None:
                 dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
                 st.caption(f"Trained: {dt.strftime('%d %b %Y %H:%M')}")
 
+        # ── Sidebar quick-chat ────────────────────────────────────────────────
+        st.markdown("---")
+        with st.expander("💬 Quick Chat", expanded=False):
+            msgs = _chat_messages()
+            for m in msgs[-2:]:
+                icon = "🧑" if m["role"] == "user" else "🤖"
+                preview = m["content"][:110] + ("…" if len(m["content"]) > 110 else "")
+                st.caption(f"**{icon}** {preview}")
+                if msgs[-2:] and m != msgs[-2:][-1]:
+                    st.markdown("<hr style='margin:4px 0'>", unsafe_allow_html=True)
+
+            with st.form("sidebar_quick_chat", clear_on_submit=True):
+                quick_input = st.text_input(
+                    "Message",
+                    label_visibility="collapsed",
+                    placeholder="Ask about the data …",
+                )
+                submitted = st.form_submit_button("Send", use_container_width=True)
+
+            if st.button("Open chatbot", key="sidebar_open_chat", use_container_width=True):
+                st.session_state["page"] = "Chatbot"
+                st.rerun()
+
+            if submitted and quick_input.strip():
+                _send_chat(quick_input.strip(), _get_series(), _get_all_results())
+                st.rerun()
+
     page = st.session_state["page"]
     if page == "Overview":
         page_overview()
@@ -868,6 +1298,10 @@ def main() -> None:
         page_model("Naive")
     elif page == "Naive + Drift":
         page_model("NaiveDrift")
+    elif page == "Chatbot":
+        page_chatbot()
+    elif page == "Settings":
+        page_settings()
     elif page == "About":
         page_about()
 
