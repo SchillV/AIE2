@@ -135,6 +135,8 @@ def make_forecast_figure(
     model_params: dict,
     n_history_days: int = 44,
     n_retro_days: int = 10,
+    alpha: float = 0.05,
+    n_boot: int = 500,
 ) -> go.Figure:
     """
     Build and return an interactive Plotly figure (does NOT save to disk).
@@ -152,7 +154,7 @@ def make_forecast_figure(
         )
 
     model_params = _normalise_params(model_params)
-    _test, pred, lower, upper = _retroactive_forecast(series, model_params, n_retro_days)
+    _test, pred, lower, upper = _retroactive_forecast(series, model_params, n_retro_days, alpha, n_boot)
 
     # History spans the full window (pre-retro + retro) so there is no gap.
     # The prediction is overlaid on the retroactive slice.

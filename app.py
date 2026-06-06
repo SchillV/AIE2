@@ -30,6 +30,12 @@ SETTINGS_PATH = Path("resources") / "settings.json"
 
 # Keys that are persisted to disk; values are the defaults.
 _SETTINGS_KEYS: dict = {
+    # Forecast display
+    "retro_days": 10,
+    "history_months": 2,
+    "ci_pct": 95,
+    "n_boot": 500,
+    # Chat / LLM backend
     "chat_backend": "claude",
     "chat_claude_model": "claude-sonnet-4-6",
     "chat_claude_key": "",
@@ -149,6 +155,9 @@ st.markdown("""
     .main .block-container { padding: 2.5rem 3rem 2rem; max-width: 1200px; }
     /* Sidebar width */
     section[data-testid="stSidebar"] { min-width: 230px; max-width: 260px; }
+    /* Hide sidebar collapse / expand controls */
+    [data-testid="stSidebarCollapseButton"] { display: none !important; }
+    [data-testid="collapsedControl"] { display: none !important; }
     /* Nav buttons: collapse spacing, left-align text */
     section[data-testid="stSidebar"] [data-testid="stButton"] { margin-bottom: 3px; }
     section[data-testid="stSidebar"] [data-testid="stButton"] > button {
@@ -584,6 +593,17 @@ def _confirm_retrain_widget(key: str, label: str) -> None:
                 st.rerun()
 
 
+def _forecast_kwargs() -> dict:
+    """Read forecast display settings from session_state for make_forecast_figure."""
+    ci_pct = int(st.session_state.get("ci_pct", 95))
+    return {
+        "n_retro_days": int(st.session_state.get("retro_days", 10)),
+        "n_history_days": int(st.session_state.get("history_months", 2)) * 22,
+        "alpha": 1.0 - ci_pct / 100,
+        "n_boot": int(st.session_state.get("n_boot", 500)),
+    }
+
+
 # ─── Pages ───────────────────────────────────────────────────────────────────
 
 def page_overview() -> None:
@@ -681,7 +701,7 @@ def page_overview() -> None:
         )
         with st.expander(label, expanded=is_best):
             try:
-                fig = make_forecast_figure(series, _normalise_params(r))
+                fig = make_forecast_figure(series, _normalise_params(r), **_forecast_kwargs())
                 st.plotly_chart(fig, use_container_width=True)
             except Exception as exc:
                 st.error(f"Chart error: {exc}")
@@ -755,7 +775,7 @@ def page_model(model_name: str) -> None:
     st.subheader("Retroactive Forecast — last 2 months · 2-week prediction window")
     from core.visualize import make_forecast_figure
     try:
-        fig = make_forecast_figure(series, _normalise_params(result))
+        fig = make_forecast_figure(series, _normalise_params(result), **_forecast_kwargs())
         st.plotly_chart(fig, use_container_width=True)
     except Exception as exc:
         st.error(f"Forecast chart error: {exc}")
@@ -887,7 +907,7 @@ def _render_chat_action(action: dict, series, all_results) -> None:
             return
         from core.visualize import make_forecast_figure
         try:
-            fig = make_forecast_figure(series, _normalise_params(result))
+            fig = make_forecast_figure(series, _normalise_params(result), **_forecast_kwargs())
             st.plotly_chart(fig, use_container_width=True)
         except Exception as exc:
             st.error(f"Chart error: {exc}")
@@ -1131,7 +1151,158 @@ def page_chatbot() -> None:
 def page_settings() -> None:
     from core.chatbot import CLAUDE_MODELS, DEFAULT_OLLAMA_MODEL, download_ollama_model
 
+    # ── Deferred actions — must run before any other rendering ───────────────
+    if st.session_state.get("settings_do_update"):
+        st.session_state["settings_do_update"] = False
+        with st.status("Fetching latest rates from BNR …", expanded=True) as s:
+            ok = _do_update_data()
+        if ok:
+            s.update(label="✅ Data updated!", state="complete")
+        st.rerun()
+        return
+
+    if st.session_state.get("run_settings_all"):
+        st.session_state["run_settings_all"] = False
+        _do_retrain_all()
+        st.rerun()
+        return
+
+    for name in MODEL_NAMES:
+        if st.session_state.get(f"run_settings_{name}"):
+            st.session_state[f"run_settings_{name}"] = False
+            _do_retrain_single(name)
+            st.rerun()
+            return
+
     st.title("Settings")
+
+    # ── Data ─────────────────────────────────────────────────────────────────
+    st.subheader("Data")
+
+    csv_ok = CSV_PATH.exists()
+    models_ok = ALL_RESULTS_PATH.exists()
+    ds1, ds2 = st.columns(2)
+    with ds1:
+        st.markdown(f"**Exchange-rate data:** {'🟢 Loaded' if csv_ok else '🔴 Not found'}")
+        if csv_ok:
+            series = _get_series()
+            if series is not None:
+                st.caption(
+                    f"{len(series):,} observations · "
+                    f"{series.index[0].date()} → {series.index[-1].date()}"
+                )
+        st.caption(f"`{CSV_PATH}`")
+    with ds2:
+        st.markdown(f"**Trained models:** {'🟢 Ready' if models_ok else '🔴 Not trained'}")
+        if models_ok:
+            ts_str = (_get_all_results() or {}).get("timestamp", "")
+            if ts_str:
+                dt_ts = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                st.caption(f"Last trained: {dt_ts.strftime('%d %b %Y %H:%M')}")
+        st.caption(f"`{MODELS_DIR}`")
+
+    if st.button("🔄 Update Data", key="settings_btn_update"):
+        st.session_state["settings_do_update"] = True
+        st.rerun()
+
+    st.divider()
+
+    # ── Training ──────────────────────────────────────────────────────────────
+    st.subheader("Training")
+    st.caption(
+        "ARIMA hyperparameter search takes 15–30 minutes. "
+        "Exponential Smoothing takes ~1 minute. "
+        "Naive baselines complete in seconds."
+    )
+
+    _confirm_retrain_widget("settings_all", "🤖 Retrain All Models")
+
+    st.markdown("**Retrain individual model:**")
+    rcols = st.columns(4)
+    for col, name in zip(rcols, MODEL_NAMES):
+        with col:
+            if st.button(
+                f"↺ {_DISPLAY[name]}",
+                key=f"settings_btn_{name}",
+                use_container_width=True,
+            ):
+                # Clear any other pending model first.
+                for other in MODEL_NAMES:
+                    st.session_state.pop(f"settings_model_pending_{other}", None)
+                st.session_state[f"settings_model_pending_{name}"] = True
+
+    # Confirmation dialogs for individual model retrain (rendered below the row).
+    for name in MODEL_NAMES:
+        if st.session_state.get(f"settings_model_pending_{name}"):
+            disp = _DISPLAY[name]
+            est = "15–30 minutes" if name == "ARIMA" else ("~1 minute" if name == "ExponentialSmoothing" else "seconds")
+            st.warning(
+                f"Retrain **{disp}**? Re-runs hyperparameter tuning and fits on all data. "
+                f"Estimated time: **{est}**."
+            )
+            go_col, cancel_col, _ = st.columns([1, 1, 5])
+            with go_col:
+                if st.button("✅ Confirm", key=f"settings_model_confirm_{name}", width="stretch"):
+                    st.session_state[f"settings_model_pending_{name}"] = False
+                    st.session_state[f"run_settings_{name}"] = True
+                    st.rerun()
+            with cancel_col:
+                if st.button("✖ Cancel", key=f"settings_model_cancel_{name}", width="stretch"):
+                    st.session_state[f"settings_model_pending_{name}"] = False
+                    st.rerun()
+
+    st.divider()
+
+    # ── Forecast Display ──────────────────────────────────────────────────────
+    st.subheader("Forecast Display")
+    st.caption("Changes take effect immediately on all forecast charts.")
+
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        st.slider(
+            "Retroactive window (business days)",
+            min_value=5,
+            max_value=20,
+            step=1,
+            key="retro_days",
+            on_change=_save_settings,
+            help=(
+                "Number of most-recent business days used as the rolling one-step-ahead "
+                "test window in the forecast chart. Matches the CV evaluation window."
+            ),
+        )
+        st.select_slider(
+            "Confidence interval",
+            options=[90, 95, 99],
+            format_func=lambda v: f"{v}%",
+            key="ci_pct",
+            on_change=_save_settings,
+            help="Width of the shaded confidence band. Applies to all models.",
+        )
+    with fc2:
+        st.select_slider(
+            "History window (months)",
+            options=[1, 2, 3, 6],
+            format_func=lambda v: f"{v} month{'s' if v > 1 else ''}",
+            key="history_months",
+            on_change=_save_settings,
+            help="How many months of historical data appear before the retroactive window.",
+        )
+        st.number_input(
+            "Bootstrap CI samples",
+            min_value=100,
+            max_value=2000,
+            step=100,
+            key="n_boot",
+            on_change=_save_settings,
+            help=(
+                "Residual bootstrap draws used to compute confidence intervals for "
+                "Exponential Smoothing and Naive models. Higher = smoother CI, slower render. "
+                "ARIMA uses Kalman-filter covariance (unaffected by this setting)."
+            ),
+        )
+
+    st.divider()
 
     # ── Chat / LLM ────────────────────────────────────────────────────────────
     st.subheader("Chat")
