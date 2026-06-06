@@ -5,6 +5,8 @@ Run with:
     streamlit run app.py
 """
 
+import contextlib
+import io
 import json
 import pickle
 import traceback
@@ -149,15 +151,17 @@ def _do_retrain_all() -> bool:
         load_series, tune_arima, tune_sarimax, tune_exp_smoothing,
         compare_models, fit_final_model,
     )
-    from core.pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR
+    from core.pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR, _write_logs
     from core.visualize import generate_all_plots
 
     MODELS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     try:
+        # Progress bar lives outside the collapsible status box so it's always visible.
+        prog = st.progress(0, text="Starting …")
+
         with st.status("Retraining all models …", expanded=True) as status:
-            prog = st.progress(0, text="Starting …")
 
             # ── Load data ─────────────────────────────────────────────────
             prog.progress(2, text="Loading exchange-rate data …")
@@ -171,7 +175,11 @@ def _do_retrain_all() -> bool:
             prog.progress(8, text="Tuning ARIMA — computing AIC candidates …")
             st.write("---")
             st.write("🔍 **ARIMA** — AIC pre-filter + walk-forward CV …")
-            arima_res = tune_arima(series)
+            _buf = io.StringIO()
+            with contextlib.redirect_stdout(_buf):
+                arima_res = tune_arima(series)
+            if _out := _buf.getvalue():
+                st.code(_out, language=None)
             st.write(
                 f"✅ ARIMA best: `order={arima_res['order']}`  "
                 f"MAE = `{arima_res['mean_mae']:.6f} ± {arima_res['std_mae']:.6f}`"
@@ -181,7 +189,11 @@ def _do_retrain_all() -> bool:
             prog.progress(35, text="Tuning SARIMAX — AIC grid search …")
             st.write("---")
             st.write("🔍 **SARIMAX** — AIC pre-filter + walk-forward CV …")
-            sarimax_res = tune_sarimax(series)
+            _buf = io.StringIO()
+            with contextlib.redirect_stdout(_buf):
+                sarimax_res = tune_sarimax(series)
+            if _out := _buf.getvalue():
+                st.code(_out, language=None)
             st.write(
                 f"✅ SARIMAX best: `order={sarimax_res['order']}  "
                 f"seasonal={sarimax_res['seasonal_order']}`  "
@@ -192,7 +204,11 @@ def _do_retrain_all() -> bool:
             prog.progress(65, text="Tuning Exponential Smoothing …")
             st.write("---")
             st.write("🔍 **Exponential Smoothing** — walk-forward CV on all valid combos …")
-            es_res = tune_exp_smoothing(series)
+            _buf = io.StringIO()
+            with contextlib.redirect_stdout(_buf):
+                es_res = tune_exp_smoothing(series)
+            if _out := _buf.getvalue():
+                st.code(_out, language=None)
             st.write(
                 f"✅ ES best: `trend={es_res['trend']}  seasonal={es_res['seasonal']}  "
                 f"damped={es_res['damped_trend']}`  "
@@ -241,16 +257,23 @@ def _do_retrain_all() -> bool:
             }
             with open(ALL_RESULTS_PATH, "w", encoding="utf-8") as fh:
                 json.dump(all_results_payload, fh, indent=2)
-            st.write(f"  · `all_results.json` updated")
+            st.write("  · `all_results.json` updated")
 
             # Diagnostics PNG
-            prog.progress(95, text="Generating diagnostic plots …")
+            prog.progress(93, text="Generating diagnostic plots …")
             all_results_dict = {
                 "ARIMA": arima_res, "SARIMAX": sarimax_res,
                 "ExponentialSmoothing": es_res, "best": best,
             }
-            generate_all_plots(series, fitted_map[best["model"]], all_results_dict)
-            st.write("  · `diagnostics.png` saved")
+            with contextlib.redirect_stdout(io.StringIO()):
+                generate_all_plots(series, fitted_map[best["model"]], all_results_dict, OUTPUT_DIR)
+            st.write("  · `resources/models/diagnostics.png` saved")
+
+            # Training logs
+            prog.progress(97, text="Writing training logs …")
+            with contextlib.redirect_stdout(io.StringIO()):
+                _write_logs(timestamp, all_results_dict, fitted_map, series)
+            st.write(f"  · `logs/{timestamp}/` written")
 
             prog.progress(100, text="Done!")
             status.update(label="✅ All models retrained successfully!", state="complete")
@@ -267,28 +290,37 @@ def _do_retrain_all() -> bool:
 def _do_retrain_single(model_name: str) -> bool:
     """Retune one model with a live st.status progress panel."""
     from core.models import load_series, tune_arima, tune_sarimax, tune_exp_smoothing, fit_final_model
-    from core.pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR, MODEL_NAMES
+    from core.pipeline import _serialise, _PKL_PREFIX as PKL, OUTPUT_DIR, MODEL_NAMES, _write_logs
 
     MODELS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     display = _DISPLAY[model_name]
 
     try:
+        # Progress bar outside the collapsible status box.
+        prog = st.progress(0, text="Starting …")
+
         with st.status(f"Retraining {display} …", expanded=True) as status:
-            prog = st.progress(0, text="Starting …")
 
             prog.progress(5, text="Loading data …")
             series = load_series(str(CSV_PATH))
-            st.write(f"✅ {len(series):,} observations loaded")
+            st.write(
+                f"✅ **Data loaded** — {len(series):,} observations "
+                f"({series.index[0].date()} → {series.index[-1].date()})"
+            )
 
             prog.progress(12, text=f"Tuning {display} …")
             st.write(f"🔍 **{display}** — hyperparameter search + walk-forward CV …")
-            if model_name == "ARIMA":
-                result = tune_arima(series)
-            elif model_name == "SARIMAX":
-                result = tune_sarimax(series)
-            else:
-                result = tune_exp_smoothing(series)
+            _buf = io.StringIO()
+            with contextlib.redirect_stdout(_buf):
+                if model_name == "ARIMA":
+                    result = tune_arima(series)
+                elif model_name == "SARIMAX":
+                    result = tune_sarimax(series)
+                else:
+                    result = tune_exp_smoothing(series)
+            if _out := _buf.getvalue():
+                st.code(_out, language=None)
             st.write(
                 f"✅ Best params: `{_params_short(result)}`  "
                 f"MAE = `{result['mean_mae']:.6f} ± {result['std_mae']:.6f}`"
@@ -324,6 +356,13 @@ def _do_retrain_single(model_name: str) -> bool:
             with open(ALL_RESULTS_PATH, "w", encoding="utf-8") as fh:
                 json.dump(stored, fh, indent=2)
             st.write("  · `all_results.json` updated")
+
+            # Training logs
+            prog.progress(95, text="Writing training logs …")
+            partial_results = {model_name: result, "best": stored.get("best", {})}
+            with contextlib.redirect_stdout(io.StringIO()):
+                _write_logs(timestamp, partial_results, {model_name: fitted}, series)
+            st.write(f"  · `logs/{timestamp}/` written")
 
             prog.progress(100, text="Done!")
             status.update(label=f"✅ {display} retrained successfully!", state="complete")
@@ -372,18 +411,12 @@ def _sorted_models(all_results: dict) -> list[dict]:
     return sorted(candidates, key=lambda x: (x["mean_mae"], x["std_mae"]))
 
 
-def _confirm_retrain_widget(key: str, label: str, action) -> None:
-    """Reusable confirm-before-retrain widget.
+def _confirm_retrain_widget(key: str, label: str) -> None:
+    """Render trigger → warning → confirm/cancel buttons.
 
-    The trigger button, warning, and confirm/cancel buttons are rendered here.
-    The action itself is deferred until *after* the column block closes so that
-    any st.status / st.progress panels it creates render at full page width.
-    """
-    """Reusable confirm-before-retrain widget.
-
-    The trigger button, warning, and confirm/cancel buttons are rendered here.
-    The action itself is deferred until *after* the column block closes so that
-    any st.status / st.progress panels it creates render at full page width.
+    Sets st.session_state[f"run_{key}"] = True and reruns on confirm.
+    The CALLER must check that flag at the top of the page function and run
+    the actual training there, so the status panel appears before page content.
     """
     if st.button(label, key=f"btn_{key}"):
         st.session_state[f"pending_{key}"] = True
@@ -392,25 +425,14 @@ def _confirm_retrain_widget(key: str, label: str, action) -> None:
         st.warning("This operation may take **15–30 minutes**. The app will be unresponsive during training.")
         col_go, col_cancel, _ = st.columns([1, 1, 5])
         with col_go:
-            if st.button("✅ Confirm", key=f"confirm_{key}", use_container_width=True):
+            if st.button("✅ Confirm", key=f"confirm_{key}", width="stretch"):
                 st.session_state[f"pending_{key}"] = False
-                st.session_state[f"run_{key}"] = True   # defer to outside the column
+                st.session_state[f"run_{key}"] = True
+                st.rerun()
         with col_cancel:
-            if st.button("✖ Cancel", key=f"cancel_{key}", use_container_width=True):
+            if st.button("✖ Cancel", key=f"cancel_{key}", width="stretch"):
                 st.session_state[f"pending_{key}"] = False
                 st.rerun()
-
-    # Run action at full page width — outside the columns above.
-    if st.session_state.get(f"run_{key}"):
-        st.session_state[f"run_{key}"] = False
-        action()
-        st.rerun()
-
-    # Run action at full page width — outside the columns above.
-    if st.session_state.get(f"run_{key}"):
-        st.session_state[f"run_{key}"] = False
-        action()
-        st.rerun()
 
 
 # ─── Pages ───────────────────────────────────────────────────────────────────
@@ -419,30 +441,35 @@ def page_overview() -> None:
     st.title("IDR / RON Exchange Rate Forecaster")
     st.caption("Source: [cursbnr.ro](https://www.cursbnr.ro) — BNR official rates · scale: **100 IDR → RON**")
 
-    series = _get_series()
-    all_results = _get_all_results()
+    # Active operations render at the top before any buttons or data.
+    if st.session_state.get("do_retrain_all_now"):
+        st.session_state["do_retrain_all_now"] = False
+        _do_retrain_all()
+        st.rerun()
+        return
 
-    # ── Action buttons ────────────────────────────────────────────────────
-    c_upd, c_retrain, _ = st.columns([1.4, 1.8, 4.8])
-    with c_upd:
-        if st.button("🔄 Update Data", use_container_width=True):
-            st.session_state["do_update_data_now"] = True   # defer to full-width context
-
-    with c_retrain:
-        # Only the trigger button lives inside the narrow column.
-        if st.button("🤖 Retrain All Models", key="btn_retrain_all", use_container_width=True):
-            st.session_state["pending_retrain_all"] = True
-
-    # Run at full page width — outside all columns above.
     if st.session_state.get("do_update_data_now"):
         st.session_state["do_update_data_now"] = False
         with st.status("Fetching latest rates from BNR …", expanded=True) as s:
             ok = _do_update_data()
         if ok:
             s.update(label="✅ Data updated!", state="complete")
-            st.rerun()
+        st.rerun()
+        return
 
-    # Confirmation dialog rendered at full page width, outside the columns above.
+    series = _get_series()
+    all_results = _get_all_results()
+
+    # ── Action buttons ────────────────────────────────────────────────────
+    c_upd, c_retrain, _ = st.columns([1.4, 1.8, 4.8])
+    with c_upd:
+        if st.button("🔄 Update Data", width="stretch"):
+            st.session_state["do_update_data_now"] = True
+            st.rerun()
+    with c_retrain:
+        if st.button("🤖 Retrain All Models", key="btn_retrain_all", width="stretch"):
+            st.session_state["pending_retrain_all"] = True
+
     if st.session_state.get("pending_retrain_all"):
         st.warning(
             "Retraining all three models with hyperparameter tuning may take "
@@ -450,26 +477,14 @@ def page_overview() -> None:
         )
         col_go, col_cancel, _ = st.columns([1, 1, 5])
         with col_go:
-            if st.button("✅ Confirm retrain", key="confirm_retrain_all", use_container_width=True):
+            if st.button("✅ Confirm retrain", key="confirm_retrain_all", width="stretch"):
                 st.session_state["pending_retrain_all"] = False
-                st.session_state["do_retrain_all_now"] = True   # defer to full-width context
-                st.session_state["do_retrain_all_now"] = True   # defer to full-width context
+                st.session_state["do_retrain_all_now"] = True
+                st.rerun()
         with col_cancel:
-            if st.button("✖ Cancel", key="cancel_retrain_all", use_container_width=True):
+            if st.button("✖ Cancel", key="cancel_retrain_all", width="stretch"):
                 st.session_state["pending_retrain_all"] = False
                 st.rerun()
-
-    # Run at full page width — outside all columns above.
-    if st.session_state.get("do_retrain_all_now"):
-        st.session_state["do_retrain_all_now"] = False
-        _do_retrain_all()
-        st.rerun()
-
-    # Run at full page width — outside all columns above.
-    if st.session_state.get("do_retrain_all_now"):
-        st.session_state["do_retrain_all_now"] = False
-        _do_retrain_all()
-        st.rerun()
 
     st.divider()
 
@@ -547,6 +562,14 @@ def page_overview() -> None:
 def page_model(model_name: str) -> None:
     display_name = _DISPLAY.get(model_name, model_name)
     st.title(display_name)
+
+    # If retraining was confirmed, show only the training panel — skip all charts.
+    run_key = f"retrain_{model_name}"
+    if st.session_state.get(f"run_{run_key}"):
+        st.session_state[f"run_{run_key}"] = False
+        _do_retrain_single(model_name)
+        st.rerun()
+        return
 
     series = _get_series()
     all_results = _get_all_results()
@@ -629,10 +652,7 @@ def page_model(model_name: str) -> None:
         "then re-fits on all available data. Other models are not affected."
     )
 
-    def _retrain_action():
-        _do_retrain_single(model_name)
-
-    _confirm_retrain_widget(f"retrain_{model_name}", f"🔁 Retrain {display_name}", _retrain_action)
+    _confirm_retrain_widget(run_key, f"🔁 Retrain {display_name}")
 
 
 def page_about() -> None:
@@ -703,7 +723,7 @@ def main() -> None:
                 page,
                 key=f"nav_{page}",
                 type="primary" if is_active else "secondary",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state["page"] = page
                 st.rerun()  # re-render immediately so button colours update

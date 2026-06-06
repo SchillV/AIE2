@@ -160,10 +160,11 @@ def _arima_fit_fn(order: tuple) -> Callable[[list[float]], float]:
 
 def tune_arima(series: pd.Series) -> dict:
     """AIC pre-filter then walk-forward CV for ARIMA(p,d,q)."""
-    print("[ARIMA] Computing AIC for all candidates …")
+    grid = list(itertools.product(ARIMA_P, ARIMA_D, ARIMA_Q))
+    print(f"[ARIMA] AIC search — {len(grid)} candidates …", flush=True)
     aic_rows: list[dict] = []
 
-    for p, d, q in itertools.product(ARIMA_P, ARIMA_D, ARIMA_Q):
+    for p, d, q in grid:
         try:
             aic = ARIMA(series, order=(p, d, q)).fit().aic
             aic_rows.append({"order": (p, d, q), "aic": aic})
@@ -172,12 +173,21 @@ def tune_arima(series: pd.Series) -> dict:
 
     aic_rows.sort(key=lambda x: x["aic"])
     candidates = aic_rows[:TOP_CV]
-    print(f"[ARIMA] CV on top-{len(candidates)} AIC candidates …")
+    print(
+        f"[ARIMA] {len(aic_rows)}/{len(grid)} converged — "
+        f"CV on top {len(candidates)} by AIC …",
+        flush=True,
+    )
 
     best: dict = {"mean_mae": float("inf")}
-    for cand in candidates:
+    n = len(candidates)
+    for i, cand in enumerate(candidates, 1):
         mean_mae, std_mae, fold_maes = walk_forward_cv(series, _arima_fit_fn(cand["order"]))
-        print(f"  order={cand['order']}  MAE={mean_mae:.6f} ± {std_mae:.6f}")
+        print(
+            f"  [{i}/{n}] order={cand['order']}  AIC={cand['aic']:.2f}  "
+            f"MAE={mean_mae:.6f} ± {std_mae:.6f}",
+            flush=True,
+        )
         if mean_mae < best["mean_mae"] or (
             mean_mae == best["mean_mae"] and std_mae < best.get("std_mae", float("inf"))
         ):
@@ -190,7 +200,11 @@ def tune_arima(series: pd.Series) -> dict:
                 "fold_maes": fold_maes,
             }
 
-    print(f"[ARIMA] Best → order={best['order']}  MAE={best['mean_mae']:.6f} ± {best['std_mae']:.6f}")
+    print(
+        f"[ARIMA] Best → order={best['order']}  "
+        f"MAE={best['mean_mae']:.6f} ± {best['std_mae']:.6f}",
+        flush=True,
+    )
     return best
 
 
@@ -207,14 +221,15 @@ def _sarimax_fit_fn(order: tuple, seasonal_order: tuple) -> Callable[[list[float
 
 def tune_sarimax(series: pd.Series) -> dict:
     """AIC pre-filter then walk-forward CV for SARIMAX."""
-    print("[SARIMAX] Computing AIC for all candidates …")
-    aic_rows: list[dict] = []
-
-    for p, d, q, P, D, Q, s in itertools.product(
+    grid = list(itertools.product(
         SARIMAX_P, SARIMAX_D, SARIMAX_Q,
         SARIMAX_SP, SARIMAX_SD, SARIMAX_SQ,
         SARIMAX_S,
-    ):
+    ))
+    print(f"[SARIMAX] AIC search — {len(grid)} candidates …", flush=True)
+    aic_rows: list[dict] = []
+
+    for p, d, q, P, D, Q, s in grid:
         try:
             aic = SARIMAX(series, order=(p, d, q), seasonal_order=(P, D, Q, s)).fit(disp=False).aic
             aic_rows.append({"order": (p, d, q), "seasonal_order": (P, D, Q, s), "aic": aic})
@@ -223,16 +238,22 @@ def tune_sarimax(series: pd.Series) -> dict:
 
     aic_rows.sort(key=lambda x: x["aic"])
     candidates = aic_rows[:TOP_CV]
-    print(f"[SARIMAX] CV on top-{len(candidates)} AIC candidates …")
+    print(
+        f"[SARIMAX] {len(aic_rows)}/{len(grid)} converged — "
+        f"CV on top {len(candidates)} by AIC …",
+        flush=True,
+    )
 
     best: dict = {"mean_mae": float("inf")}
-    for cand in candidates:
+    n = len(candidates)
+    for i, cand in enumerate(candidates, 1):
         mean_mae, std_mae, fold_maes = walk_forward_cv(
             series, _sarimax_fit_fn(cand["order"], cand["seasonal_order"])
         )
         print(
-            f"  order={cand['order']} seasonal={cand['seasonal_order']}  "
-            f"MAE={mean_mae:.6f} ± {std_mae:.6f}"
+            f"  [{i}/{n}] order={cand['order']} seasonal={cand['seasonal_order']}  "
+            f"AIC={cand['aic']:.2f}  MAE={mean_mae:.6f} ± {std_mae:.6f}",
+            flush=True,
         )
         if mean_mae < best["mean_mae"] or (
             mean_mae == best["mean_mae"] and std_mae < best.get("std_mae", float("inf"))
@@ -249,7 +270,8 @@ def tune_sarimax(series: pd.Series) -> dict:
 
     print(
         f"[SARIMAX] Best → order={best['order']} seasonal={best['seasonal_order']}  "
-        f"MAE={best['mean_mae']:.6f} ± {best['std_mae']:.6f}"
+        f"MAE={best['mean_mae']:.6f} ± {best['std_mae']:.6f}",
+        flush=True,
     )
     return best
 
@@ -279,22 +301,23 @@ def _es_fit_fn(
 
 def tune_exp_smoothing(series: pd.Series) -> dict:
     """Walk-forward CV over all valid Exponential Smoothing combinations."""
-    print("[ExponentialSmoothing] Walk-forward CV on all valid candidates …")
+    valid = [
+        (t, s, d, sp)
+        for t, s, d, sp in itertools.product(ES_TREND, ES_SEASONAL, ES_DAMPED, ES_PERIODS)
+        if not (d and not t) and not (s and sp < 2)
+    ]
+    print(f"[ES] Walk-forward CV on {len(valid)} valid combos …", flush=True)
 
     best: dict = {"mean_mae": float("inf")}
-    for trend, seasonal, damped, sp in itertools.product(
-        ES_TREND, ES_SEASONAL, ES_DAMPED, ES_PERIODS
-    ):
-        if damped and not trend:
-            continue
-        if seasonal and sp < 2:
-            continue
-
+    for i, (trend, seasonal, damped, sp) in enumerate(valid, 1):
         mean_mae, std_mae, fold_maes = walk_forward_cv(
             series, _es_fit_fn(trend, seasonal, damped, sp)
         )
-        label = f"trend={trend} seasonal={seasonal} damped={damped} sp={sp}"
-        print(f"  {label}  MAE={mean_mae:.6f} ± {std_mae:.6f}")
+        print(
+            f"  [{i}/{len(valid)}] trend={trend} seasonal={seasonal} "
+            f"damped={damped} sp={sp}  MAE={mean_mae:.6f} ± {std_mae:.6f}",
+            flush=True,
+        )
 
         if mean_mae < best["mean_mae"] or (
             mean_mae == best["mean_mae"] and std_mae < best.get("std_mae", float("inf"))
@@ -312,7 +335,8 @@ def tune_exp_smoothing(series: pd.Series) -> dict:
 
     print(
         f"[ES] Best → trend={best['trend']} seasonal={best['seasonal']}  "
-        f"MAE={best['mean_mae']:.6f} ± {best['std_mae']:.6f}"
+        f"MAE={best['mean_mae']:.6f} ± {best['std_mae']:.6f}",
+        flush=True,
     )
     return best
 

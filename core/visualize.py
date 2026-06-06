@@ -363,3 +363,80 @@ def generate_all_plots(
     """Save the combined all-models diagnostic PNG. (forecast.html is now served by the app.)"""
     output_dir = Path(output_dir)
     _plot_diagnostics(series, fitted_model, all_results, output_dir)
+
+
+# --------------------------------------------------------------------------- #
+# Public: forecast data extraction and static chart (used by pipeline logs)   #
+# --------------------------------------------------------------------------- #
+
+def retroactive_forecast_df(
+    series: pd.Series,
+    model_params: dict,
+    n_retro_days: int = 10,
+) -> pd.DataFrame:
+    """
+    Run the retroactive forecast and return results as a DataFrame.
+
+    Columns: actual, predicted, lower_95, upper_95.
+    Index: DatetimeIndex of the retroactive evaluation window.
+    """
+    model_params = _normalise_params(model_params)
+    actual, pred, lower, upper = _retroactive_forecast(series, model_params, n_retro_days)
+    return pd.DataFrame(
+        {
+            "actual": actual.values,
+            "predicted": pred.values,
+            "lower_95": lower.values,
+            "upper_95": upper.values,
+        },
+        index=actual.index,
+    )
+
+
+def make_forecast_figure_static(
+    series: pd.Series,
+    model_params: dict,
+    n_history_days: int = 44,
+    n_retro_days: int = 10,
+) -> plt.Figure:
+    """Matplotlib forecast chart for saving to PNG in training logs.
+
+    Shows the same retroactive window as the interactive Plotly chart in the app,
+    but as a static matplotlib figure that can be saved without kaleido.
+    """
+    model_params = _normalise_params(model_params)
+    actual, pred, lower, upper = _retroactive_forecast(series, model_params, n_retro_days)
+
+    history_start = max(0, len(series) - n_history_days - n_retro_days)
+    history = series.iloc[history_start:]
+
+    model_name = model_params["model"]
+    mae = model_params.get("mean_mae", float("nan"))
+    std_mae = model_params.get("std_mae", float("nan"))
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    ax.plot(history.index, history.values, color="#2c7bb6", lw=2, label="Actual rate")
+    ax.fill_between(
+        pred.index, lower.values, upper.values,
+        color="#ff7f0e", alpha=0.20, label="95% CI",
+    )
+    ax.plot(
+        pred.index, pred.values,
+        color="#ff7f0e", lw=2, linestyle="--", marker="o", markersize=5,
+        label=f"Predicted – {model_name}",
+    )
+    ax.axvspan(actual.index[0], actual.index[-1], alpha=0.05, color="#ff7f0e")
+    ax.axvline(actual.index[0], color="#888888", lw=1, linestyle=":", alpha=0.8)
+
+    ax.set_title(
+        f"IDR/RON – {model_name} Retroactive Forecast\n"
+        f"CV MAE = {mae:.6f}  ±  {std_mae:.6f}",
+        fontsize=12,
+    )
+    ax.set_xlabel("Date")
+    ax.set_ylabel("100 IDR / RON")
+    ax.legend(fontsize=9)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return fig

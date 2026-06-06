@@ -24,7 +24,12 @@ from .models import (
     compare_models,
     fit_final_model,
 )
-from .visualize import generate_all_plots, make_per_model_diagnostic_figure
+from .visualize import (
+    generate_all_plots,
+    make_per_model_diagnostic_figure,
+    retroactive_forecast_df,
+    make_forecast_figure_static,
+)
 
 OUTPUT_DIR = Path("resources") / "models"
 LOG_DIR = Path("logs")
@@ -153,6 +158,37 @@ def _write_logs(
     best_fitted = fitted_map.get(best_name)
     if best_fitted is not None:
         generate_all_plots(series, best_fitted, all_results, log_dir)
+
+    # ── retroactive forecast CSV + per-model PNGs ──────────────────────────────
+    forecast_dfs: list[pd.DataFrame] = []
+    for name in MODEL_NAMES:
+        res = all_results.get(name)
+        if res is None:
+            continue
+        prefix = _PKL_PREFIX.get(name, name.lower())
+        try:
+            df = retroactive_forecast_df(series, res)
+            df = df.rename(columns={
+                "predicted": f"{prefix}_predicted",
+                "lower_95":  f"{prefix}_lower_95",
+                "upper_95":  f"{prefix}_upper_95",
+            })
+            forecast_dfs.append(df)
+
+            fig = make_forecast_figure_static(series, res)
+            fig.savefig(log_dir / f"forecast_{prefix}.png", dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  · forecast_{prefix}.png")
+        except Exception as exc:
+            print(f"  [WARN] Forecast for {name} skipped: {exc}")
+
+    if forecast_dfs:
+        merged = forecast_dfs[0]
+        for df in forecast_dfs[1:]:
+            merged = merged.join(df.drop(columns=["actual"], errors="ignore"), how="outer")
+        merged.index.name = "date"
+        merged.to_csv(log_dir / "forecast.csv")
+        print(f"  · forecast.csv")
 
     print(f"Training logs → {log_dir}/")
 
